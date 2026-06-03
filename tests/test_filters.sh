@@ -5,11 +5,11 @@
 SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/MigrateADMobileAccountToLocalAccount.sh"
 # Load only the helpers between the markers; the rest of the script would run a migration.
 # (bash 3.2 can't `source <(...)`, so use eval.)
-helpers=$(sed -n '/^# BEGIN helpers/,/^# END helpers/p' "$SCRIPT")
+helpers=$(sed -n '/^# BEGIN helpers/,/^# END helpers/p;/^# BEGIN readonly checks/,/^# END readonly checks/p' "$SCRIPT")
 [[ -n "$helpers" ]] || { echo "Could not find the helpers block in $SCRIPT"; exit 2; }
 eval "$helpers"
 # A missing function must fail loudly instead of reading as "not flagged".
-for fn in attr_values_from_plist plist_keys attr_values extra_policy_keys is_ad_authority_entry is_ad_alt_identity is_domain_alias is_ad_attribute_key; do
+for fn in attr_values_from_plist plist_keys record_values extra_policy_keys home_acl_is_stock is_enabled is_ad_search_path find_differences is_bound in_group is_ad_authority_entry is_ad_alt_identity is_domain_alias is_ad_attribute_key; do
     declare -F "$fn" >/dev/null || { echo "helper not loaded: $fn"; exit 2; }
 done
 
@@ -78,16 +78,74 @@ POLICY='<plist version="1.0"><dict><key>creationTime</key><real>1.0</real><key>f
 check "fresh policy keys not flagged" "" "$(extra_policy_keys jdoe)"
 unset -f dscl
 
+# --- ACL: only the stock entry counts
+STOCK_LS='drwxr-xr-x+ 72 jdoe  staff  2304 Sep 18 22:12 /Users/jdoe
+ 0: group:everyone deny delete'
+check "stock ACL"          yes "$(truthy home_acl_is_stock "$STOCK_LS")"
+check "no ACL"             no  "$(truthy home_acl_is_stock 'drwxr-xr-x 72 jdoe staff 2304 Sep 18 22:12 /Users/jdoe')"
+check "extra domain ACL"   no  "$(truthy home_acl_is_stock "$STOCK_LS
+ 1: group:11111111-2222-3333-4444-555555555555 allow list,search")"
+check "wrong ACL"          no  "$(truthy home_acl_is_stock 'drwxr-xr-x+ 1 a b 1 Jan 1 /x
+ 0: user:x allow read')"
+
+# --- search paths and the GrantAdmin switch
+check "AD search path"     yes "$(truthy is_ad_search_path '/Active Directory/All Domains')"
+check "domain search path" yes "$(truthy is_ad_search_path '/Active Directory/CORP/corp.example.com')"
+check "local search path"  no  "$(truthy is_ad_search_path '/Local/Default')"
+for v in true TRUE yes 1; do check "GrantAdmin=$v is on" yes "$(truthy is_enabled "$v")"; done
+for v in false no 0 "" maybe; do check "GrantAdmin='$v' is off" no "$(truthy is_enabled "$v")"; done
+
+# --- find_differences on a stubbed AD mobile account: every difference must be reported
+plist_doc() { # $1 = key, rest = values
+    local key="$1" out="<plist version=\"1.0\"><dict><key>$1</key><array>" v; shift
+    for v in "$@"; do out+="<string>$(xml_escape "$v")</string>"; done
+    printf '%s' "$out</array></dict></plist>"
+}
+dscl() {
+    case "$*" in
+        "-plist . -read /Users/jdoe AuthenticationAuthority") plist_doc dsAttrTypeStandard:AuthenticationAuthority "$ADK" "$SHADOW" "$LKDC" "$CACHED" "$TOKEN" ;;
+        "-plist . -read /Users/jdoe AltSecurityIdentities") plist_doc dsAttrTypeStandard:AltSecurityIdentities "Kerberos:jdoe@CORP.EXAMPLE.COM" "X509:<T>Apple" ;;
+        "-plist . -read /Users/jdoe RecordName") plist_doc dsAttrTypeStandard:RecordName jdoe jdoe@corp.example.com ;;
+        "-plist . -read /Users/jdoe dsAttrTypeNative:accountPolicyData") plist_doc dsAttrTypeNative:accountPolicyData "$policy_xml" ;;
+        "-plist . -read /Users/jdoe") printf '%s' '<plist version="1.0"><dict><key>dsAttrTypeStandard:RecordName</key><array><string>jdoe</string></array><key>dsAttrTypeStandard:CachedGroups</key><array><string>g</string></array><key>dsAttrTypeStandard:AuthenticationAuthority</key><array><string>x</string></array></dict></plist>' ;;
+        ". -read /Users/jdoe PrimaryGroupID") echo "PrimaryGroupID: 12" ;;
+        ". -read /Groups/staff GroupMembership") echo "GroupMembership: root jdoe" ;;
+        "-plist . -read /Groups/admin NestedGroups") plist_doc dsAttrTypeStandard:NestedGroups "AAAA-BBBB" ;;
+        *) return 1 ;;
+    esac
+}
+dsconfigad() { echo "Active Directory Domain = corp.example.com"; }
+username=jdoe; homedir=/nonexistent/jdoe
+expected="This Mac is still bound to Active Directory
+AuthenticationAuthority has an AD entry
+AuthenticationAuthority has an AD entry
+AD attribute remains: dsAttrTypeStandard:CachedGroups
+AltSecurityIdentities has an AD Kerberos principal
+RecordName has a domain alias: jdoe@corp.example.com
+PrimaryGroupID is 12, a fresh account uses 20
+Account policy still has AD rules
+The admin group has nested (AD) groups
+The user is listed in the staff group; on a fresh account only root is"
+check "mobile account: every difference reported" "$expected" "$(find_differences)"
+unset -f dscl dsconfigad plist_doc
+
 # --- real, unmodified local account on this Mac: nothing may be flagged
 if [[ "${1:-}" != "--no-live" ]] && u=$(stat -f%Su /dev/console) && dscl . -read "/Users/$u" &>/dev/null; then
-    live_ad=$(attr_values "$u" AuthenticationAuthority | while IFS= read -r e; do is_ad_authority_entry "$e" && echo "$e"; done)
+    live_ad=$(record_values "/Users/$u" AuthenticationAuthority | while IFS= read -r e; do is_ad_authority_entry "$e" && echo "$e"; done)
     check "live account: no AD authority entries flagged" "" "$live_ad"
     live_attrs=$(plist_keys "$(dscl -plist . -read "/Users/$u")" | while IFS= read -r k; do is_ad_attribute_key "$k" && echo "$k"; done)
     check "live account: no AD attributes flagged" "" "$live_attrs"
-    live_alt=$(attr_values "$u" AltSecurityIdentities | while IFS= read -r v; do is_ad_alt_identity "$v" && echo "$v"; done)
+    live_alt=$(record_values "/Users/$u" AltSecurityIdentities | while IFS= read -r v; do is_ad_alt_identity "$v" && echo "$v"; done)
     check "live account: no alt identities flagged" "" "$live_alt"
+    # The whole detection, against a real stock account: it must find no difference at all.
+    username=$u
+    homedir=$(dscl . -read "/Users/$u" NFSHomeDirectory | sed 's/^NFSHomeDirectory: //')
+    check "live account: find_differences is empty" "" "$(find_differences)"
+    check "live account: admin NestedGroups absent (dscl exits 0 for a missing key)" "" "$(record_values /Groups/admin NestedGroups)"
+    check "live account: no AD search path" "" "$(record_values /Search CSPSearchPath | while IFS= read -r p; do is_ad_search_path "$p" && echo "$p"; done)"
+    check "live account: home ACL is stock" yes "$(truthy home_acl_is_stock "$(ls -lde "$homedir")")"
     check "live account: no extra policy keys" "" "$(extra_policy_keys "$u")"
-    check "live account: has entries to inspect" yes "$(truthy test "$(attr_values "$u" AuthenticationAuthority | grep -c .)" -ge 2)"
+    check "live account: has entries to inspect" yes "$(truthy test "$(record_values "/Users/$u" AuthenticationAuthority | grep -c .)" -ge 2)"
 fi
 
 echo "passed: $pass  failed: $fail"
