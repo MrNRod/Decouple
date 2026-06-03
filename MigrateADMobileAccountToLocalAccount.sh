@@ -1,6 +1,6 @@
 #!/bin/bash
-# Modified 7/11/2025
-Version=1.7
+# Modified 9/19/2026
+Version=1.8
 
 # Logging configuration
 LOG_FILE="/var/log/mobile_to_local_migration.log"
@@ -155,9 +155,38 @@ migration_error=0
 #
 # 1. Added a check to see if the account is already a local account and AD is not bound before proceeding with the conversion process.
 # 2. Changed the chmod command to use the -RN flag to remove all ACLs from the home directory.
+#
+# Version 1.8
+#
+# Goal: the converted account matches a fresh local account. Verified against a stock macOS account.
+#
+# Changes:
+#
+# 1. AuthenticationAuthority: every entry is inspected. Only Active Directory entries (LocalCachedUser,
+#    Kerberosv5 that is not @LKDC, NetLogon) are removed. ShadowHash, SecureToken and the local
+#    Kerberosv5 @LKDC entry are never removed. Version 1.7 removed the FIRST Kerberosv5 entry, which
+#    can be the local one and can leave the AD one behind.
+# 2. AltSecurityIdentities: only AD Kerberos values are removed, not the whole attribute (an Apple
+#    Account keeps an X509 value there).
+# 3. Attributes are removed only when present, so a missing attribute no longer counts as a migration
+#    error (which used to stop the marker file from being written).
+# 4. The account is no longer added to the staff group: a fresh account is a member through
+#    PrimaryGroupID 20 and staff lists only root. PrimaryGroupID is reset to 20, and an explicit staff
+#    listing from an earlier version is removed.
+# 5. Home folder is set to 755 with the "everyone deny delete" ACL, like a fresh account.
+# 6. FileVault guard: aborts if SecureToken or the FileVault crypto-user entry disappears.
+# 7. Account record is backed up (without the password hash) to /var/log before any change.
+# 8. Kerberos tickets are destroyed in the user's session; the user name is validated;
+#    a predictable /tmp file is replaced by mktemp; the home path is read without awk word splitting.
+# 9. A final check compares the account with a fresh local account and logs any difference.
 
 clear
 username=$EnrollmentUser
+if [[ ! "$username" =~ ^[A-Za-z0-9._-]{1,64}$ || "$username" == -* ]]; then
+    log_message "ERROR" "Invalid target user name: '$username'. Exiting."
+    echo "Invalid target user name. Exiting."
+    exit 1
+fi
 FullScriptName=$(basename "$0")
 ShowVersion="$FullScriptName $Version"
 
@@ -242,46 +271,180 @@ RemoveAD(){
     log_message "INFO" "AD removal process completed"
 }
 
+# BEGIN helpers (pure text handling, unit tested in tests/test_filters.sh)
+
+# Attributes an AD mobile account adds and a local account never has (lower case, namespace stripped).
+# Deliberately NOT listed: AltSecurityIdentities (value-filtered), accountPolicyData (pwpolicy),
+# _writers_LinkedIdentity (Apple Account), AppleMeta* (virtual). A fresh account can have these.
+AD_ATTRS=(
+    cachedgroups smbprimarygroupsid originalauthenticationauthority originalnodename smbsid
+    smbscriptpath smbpasswordlastset smbgrouprid mcxsettings mcxflags accounttype copytimestamp
+    account_instance cached_auth_policy cached_groups original_realname original_shell
+    preserved_attributes email_address primaryntdomain firstname lastname jobtitle company
+    department emailaddress
+)
+
+# Prints the strings of the first array in a dscl -plist document, one per line.
+attr_values_from_plist() {
+    local plist="$1" count i value
+    count=$(xmllint --xpath 'count(//dict/array/string)' - <<<"$plist" 2>/dev/null) || return 1
+    for ((i = 1; i <= count; i++)); do
+        # $(...) drops xmllint's trailing newline (newer libxml prints one, older doesn't).
+        value=$(xmllint --xpath "string(//dict/array/string[$i])" - <<<"$plist")
+        printf '%s\n' "$value"
+    done
+}
+
+# Prints every key of a dscl -plist record document, one per line.
+plist_keys() {
+    local plist="$1" count i value
+    count=$(xmllint --xpath 'count(//dict/key)' - <<<"$plist" 2>/dev/null) || return 1
+    for ((i = 1; i <= count; i++)); do
+        value=$(xmllint --xpath "string(//dict/key[$i])" - <<<"$plist")
+        printf '%s\n' "$value"
+    done
+}
+
+# $1 = user, $2 = attribute
+attr_values() {
+    local plist
+    plist=$(dscl -plist . -read "/Users/$1" "$2" 2>/dev/null) || return 1
+    attr_values_from_plist "$plist"
+}
+
+# True for an Active Directory AuthenticationAuthority entry. Never true for the entries a local
+# account needs: the password hash, the FileVault token and the local KDC.
+is_ad_authority_entry() {
+    case "$1" in
+        *ShadowHash* | *SecureToken* | *LKDC:*) return 1 ;;
+        *LocalCachedUser* | *Kerberosv5* | *"Active Directory"* | ";NetLogon;"*) return 0 ;;
+    esac
+    return 1
+}
+
+# True for an AD Kerberos principal in AltSecurityIdentities (not X509, not the local KDC).
+is_ad_alt_identity() {
+    [[ "$1" == Kerberos:* && "$1" != *LKDC:* ]]
+}
+
+# True for a "user@DOMAIN" alias in RecordName.
+is_domain_alias() {
+    [[ "$1" == *@* && "$1" != *LKDC* ]]
+}
+
+# True if a record key (dsAttrTypeStandard:X / dsAttrTypeNative:x) is a leftover AD attribute.
+is_ad_attribute_key() {
+    local key="${1#dsAttrTypeStandard:}" attr
+    key="${key#dsAttrTypeNative:}"
+    key=$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')
+    for attr in "${AD_ATTRS[@]}"; do
+        [[ "$key" == "$attr" ]] && return 0
+    done
+    return 1
+}
+
+# Keys in accountPolicyData that a fresh account doesn't have (AD-imposed password rules).
+# A fresh account has only: creationTime, failedLoginCount, failedLoginTimestamp, passwordLastSetTime.
+extra_policy_keys() {
+    local outer inner key
+    outer=$(dscl -plist . -read "/Users/$1" dsAttrTypeNative:accountPolicyData 2>/dev/null) || return 0
+    inner=$(attr_values_from_plist "$outer")
+    while IFS= read -r key; do
+        case "$key" in
+            "" | creationTime | failedLoginCount | failedLoginTimestamp | passwordLastSetTime) ;;
+            *) echo "$key" ;;
+        esac
+    done < <(plist_keys "$inner")
+}
+# END helpers
+
+# Deletes single values of a multi-valued attribute, keeping the others.
+# $1 = attribute, $2 = predicate function
+RemoveMatchingValues() {
+    local attribute="$1" predicate="$2" value removed=0
+    while IFS= read -r value; do
+        [[ -n "$value" ]] || continue
+        "$predicate" "$value" || continue
+        log_message "INFO" "Removing $attribute value: ${value:0:60}"
+        if dscl . -delete "/Users/$username" "$attribute" "$value"; then
+            removed=$((removed + 1))
+        else
+            log_message "ERROR" "Failed to remove a $attribute value"
+            migration_error=1
+        fi
+    done < <(attr_values "$username" "$attribute")
+    log_message "INFO" "$attribute: removed $removed value(s)"
+}
+
+RemoveADAttributes() {
+    local plist key removed=0
+    plist=$(dscl -plist . -read "/Users/$username" 2>/dev/null)
+    while IFS= read -r key; do
+        [[ -n "$key" ]] && is_ad_attribute_key "$key" || continue
+        if dscl . -delete "/Users/$username" "$key"; then
+            log_message "DEBUG" "Removed $key"
+            removed=$((removed + 1))
+        else
+            log_message "ERROR" "Failed to remove $key"
+            migration_error=1
+        fi
+    done < <(plist_keys "$plist")
+    log_message "INFO" "Removed $removed AD attribute(s)"
+}
+
+# FileVault / SecureToken guard. Captured before any change to the account.
+HAD_SECURETOKEN=0
+FILEVAULT_ON=0
+CRYPTO_BEFORE=""
+crypto_users() {
+    diskutil apfs listCryptoUsers / 2>/dev/null | grep -Eo '[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}' | tr '[:lower:]' '[:upper:]' | sort | tr '\n' ' '
+}
+
+CaptureFileVaultState() {
+    attr_values "$username" AuthenticationAuthority | grep -q "SecureToken" && HAD_SECURETOKEN=1
+    if fdesetup status 2>/dev/null | grep -q "FileVault is On"; then
+        FILEVAULT_ON=1
+        CRYPTO_BEFORE=$(crypto_users)
+    fi
+    log_message "INFO" "FileVault on: $FILEVAULT_ON, SecureToken present: $HAD_SECURETOKEN"
+}
+
+# Exits if the user could no longer unlock FileVault.
+CheckFileVaultIntact() {
+    if [[ $HAD_SECURETOKEN -eq 1 ]] && ! attr_values "$username" AuthenticationAuthority | grep -q "SecureToken"; then
+        log_message "ERROR" "SecureToken entry is gone. Stopping: $username may not be able to unlock FileVault."
+        exit 1
+    fi
+    if [[ $FILEVAULT_ON -eq 1 && "$(crypto_users)" != "$CRYPTO_BEFORE" ]]; then
+        log_message "ERROR" "FileVault crypto users changed. Stopping."
+        exit 1
+    fi
+}
+
+# Restore point written before any change. The password hash is never included.
+BackupAccountRecord() {
+    local file
+    file="/var/log/mobile_to_local_backup_${username}_$(date +%s).plist"
+    if ( umask 077; dscl -plist . -read "/Users/$username" > "$file" ); then
+        plutil -remove 'dsAttrTypeNative:ShadowHashData' "$file" 2>/dev/null
+        chmod 600 "$file"
+        log_message "INFO" "Account record backed up to $file"
+    else
+        log_message "ERROR" "Could not back up the account record. Exiting."
+        exit 1
+    fi
+}
+
 PasswordMigration(){
-    log_message "INFO" "Starting password migration process..."
-    
-    # macOS 10.14.4 will remove the the actual ShadowHashData key immediately 
-    # if the AuthenticationAuthority array value which references the ShadowHash
-    # is removed from the AuthenticationAuthority array. To address this, the
-    # existing AuthenticationAuthority array will be modified to remove the Kerberos
-    # and LocalCachedUser user values.
- 
-    AuthenticationAuthority=$(dscl -plist . -read /Users/"$username" AuthenticationAuthority)
-    log_message "DEBUG" "Current AuthenticationAuthority: $AuthenticationAuthority"
-    
-    Kerberosv5=$(echo "${AuthenticationAuthority}" | xmllint --xpath 'string(//string[contains(text(),"Kerberosv5")])' -)
-    LocalCachedUser=$(echo "${AuthenticationAuthority}" | xmllint --xpath 'string(//string[contains(text(),"LocalCachedUser")])' -)
-    
-    log_message "DEBUG" "Found Kerberosv5: $Kerberosv5"
-    log_message "DEBUG" "Found LocalCachedUser: $LocalCachedUser"
-    
-    # Remove Kerberosv5 and LocalCachedUser
-    if [[ ! -z "${Kerberosv5}" ]]; then
-        log_message "INFO" "Removing Kerberosv5 from AuthenticationAuthority..."
-        if dscl -plist . -delete "/Users/$username" AuthenticationAuthority "${Kerberosv5}"; then
-            log_message "INFO" "Successfully removed Kerberosv5"
-        else
-            log_message "ERROR" "Failed to remove Kerberosv5"
-            migration_error=1
-        fi
-    fi
-    
-    if [[ ! -z "${LocalCachedUser}" ]]; then
-        log_message "INFO" "Removing LocalCachedUser from AuthenticationAuthority..."
-        if dscl -plist . -delete "/Users/$username" AuthenticationAuthority "${LocalCachedUser}"; then
-            log_message "INFO" "Successfully removed LocalCachedUser"
-        else
-            log_message "ERROR" "Failed to remove LocalCachedUser"
-            migration_error=1
-        fi
-    fi
-    
-    log_message "INFO" "Password migration process completed"
+    log_message "INFO" "Starting authentication authority cleanup..."
+
+    # macOS 10.14.4 removes the actual ShadowHashData key immediately if the AuthenticationAuthority
+    # value that references the ShadowHash is removed. Only AD entries are removed here; the
+    # ShadowHash, SecureToken and local Kerberos (@LKDC) entries stay, so the local password and the
+    # FileVault login keep working.
+    RemoveMatchingValues AuthenticationAuthority is_ad_authority_entry
+    CheckFileVaultIntact
+    log_message "INFO" "Authentication authority cleanup completed"
 }
 
 RunAsRoot "${0}"
@@ -340,57 +503,44 @@ else
 fi
 
 log_message "INFO" "Starting account attribute removal process..."
-	
-# Remove the account attributes that identify it as an Active Directory mobile account
-log_message "DEBUG" "Removing cached_groups..."
-dscl . -delete "/Users/$username" cached_groups || { log_message "ERROR" "Failed to remove cached_groups"; migration_error=1; }
 
-log_message "DEBUG" "Removing cached_auth_policy..."
-dscl . -delete "/Users/$username" cached_auth_policy || { log_message "ERROR" "Failed to remove cached_auth_policy"; migration_error=1; }
+CaptureFileVaultState
+BackupAccountRecord
+original_gid=$(dscl . -read /Users/"$username" PrimaryGroupID 2>/dev/null | awk '{print $2}')
+log_message "INFO" "Original PrimaryGroupID: $original_gid"
 
-log_message "DEBUG" "Removing CopyTimestamp..."
-dscl . -delete "/Users/$username" CopyTimestamp || { log_message "ERROR" "Failed to remove CopyTimestamp"; migration_error=1; }
+# Remove the account attributes that identify it as an Active Directory mobile account.
+# Only attributes that are present are touched, so a missing one is not an error.
+RemoveADAttributes
 
-log_message "DEBUG" "Removing AltSecurityIdentities..."
-dscl . -delete "/Users/$username" AltSecurityIdentities || { log_message "ERROR" "Failed to remove AltSecurityIdentities"; migration_error=1; }
+# AD Kerberos principals and "user@DOMAIN" aliases only; the Apple Account value and the primary name stay.
+RemoveMatchingValues AltSecurityIdentities is_ad_alt_identity
+RemoveMatchingValues RecordName is_domain_alias
 
-log_message "DEBUG" "Removing SMBPrimaryGroupSID..."
-dscl . -delete "/Users/$username" SMBPrimaryGroupSID || { log_message "ERROR" "Failed to remove SMBPrimaryGroupSID"; migration_error=1; }
+# Clear AD-imposed password rules (expiry etc.); a fresh account has none. Only when there are any,
+# so a fresh account's own policy data (creation time etc.) is left alone.
+if [[ -n "$(extra_policy_keys "$username")" ]]; then
+    log_message "INFO" "Clearing AD account policies..."
+    pwpolicy -n /Local/Default -u "$username" -clearaccountpolicies || log_message "WARN" "pwpolicy -clearaccountpolicies failed"
+else
+    log_message "INFO" "No AD account policies to clear"
+fi
 
-log_message "DEBUG" "Removing OriginalAuthenticationAuthority..."
-dscl . -delete "/Users/$username" OriginalAuthenticationAuthority || { log_message "ERROR" "Failed to remove OriginalAuthenticationAuthority"; migration_error=1; }
-
-log_message "DEBUG" "Removing OriginalNodeName..."
-dscl . -delete "/Users/$username" OriginalNodeName || { log_message "ERROR" "Failed to remove OriginalNodeName"; migration_error=1; }
-
-log_message "DEBUG" "Removing SMBSID..."
-dscl . -delete "/Users/$username" SMBSID || { log_message "ERROR" "Failed to remove SMBSID"; migration_error=1; }
-
-log_message "DEBUG" "Removing SMBScriptPath..."
-dscl . -delete "/Users/$username" SMBScriptPath || { log_message "ERROR" "Failed to remove SMBScriptPath"; migration_error=1; }
-
-log_message "DEBUG" "Removing SMBPasswordLastSet..."
-dscl . -delete "/Users/$username" SMBPasswordLastSet || { log_message "ERROR" "Failed to remove SMBPasswordLastSet"; migration_error=1; }
-
-log_message "DEBUG" "Removing SMBGroupRID..."
-dscl . -delete "/Users/$username" SMBGroupRID || { log_message "ERROR" "Failed to remove SMBGroupRID"; migration_error=1; }
-
-log_message "DEBUG" "Removing PrimaryNTDomain..."
-dscl . -delete "/Users/$username" PrimaryNTDomain || { log_message "ERROR" "Failed to remove PrimaryNTDomain"; migration_error=1; }
-
-log_message "DEBUG" "Removing AppleMetaRecordName..."
-dscl . -delete "/Users/$username" AppleMetaRecordName || { log_message "ERROR" "Failed to remove AppleMetaRecordName"; migration_error=1; }
-
-log_message "DEBUG" "Removing MCXSettings..."
-dscl . -delete "/Users/$username" MCXSettings || { log_message "ERROR" "Failed to remove MCXSettings"; migration_error=1; }
-
-log_message "DEBUG" "Removing MCXFlags..."
-dscl . -delete "/Users/$username" MCXFlags || { log_message "ERROR" "Failed to remove MCXFlags"; migration_error=1; }
+# Destroy the user's Kerberos tickets. As root plain kdestroy only clears root's, so run it in the user's session.
+launchctl asuser "$(id -u "$username")" /usr/bin/kdestroy -a 2>/dev/null || log_message "DEBUG" "No Kerberos tickets to destroy"
 
 log_message "INFO" "Account attribute removal completed"
 
-# Migrate password and remove AD-related attributes
+# Remove AD entries from AuthenticationAuthority
 PasswordMigration
+
+# A fresh account is in staff through PrimaryGroupID 20. Record changes finish here,
+# before the file system is touched.
+log_message "INFO" "Resetting PrimaryGroupID to 20 (staff)..."
+if ! dscl . -create "/Users/$username" PrimaryGroupID 20; then
+    log_message "ERROR" "Failed to reset PrimaryGroupID"
+    migration_error=1
+fi
 
 # Refresh Directory Services
 log_message "INFO" "Refreshing Directory Services..."
@@ -429,7 +579,7 @@ else
 fi
 
 log_message "INFO" "Updating home directory permissions..."
-homedir=$(dscl . -read /Users/"$username" NFSHomeDirectory  | awk '{print $2}')
+homedir=$(dscl . -read /Users/"$username" NFSHomeDirectory | sed 's/^NFSHomeDirectory: //')
 if [[ -d "$homedir" ]]; then
     log_message "INFO" "Home directory location: $homedir"
 
@@ -441,23 +591,34 @@ if [[ -d "$homedir" ]]; then
         log_message "WARN" "Failed to remove ACLs"
         migration_error=1
     fi
-    
-    # Set the home directory ownership to the user and the group to staff (20)
-    log_message "INFO" "Resetting ownership of $homedir (some paths may be protected by SIP)"
 
-    if chown -R "$username:staff" "$homedir" 2>/tmp/chown_errors.log; then
-        log_message "INFO" "chown completed (non-fatal errors may be logged)"
-    else
-        if grep -q "Operation not permitted" /tmp/chown_errors.log; then
-            log_message "WARN" "chown reported 'Operation not permitted' on protected files — safe to ignore"
+    # Set the home directory ownership to the user and the group to staff (20).
+    # Only recurse into a folder that is clearly this user's.
+    if [[ "$(basename "$homedir")" == "$username" && "$homedir" != "/" ]]; then
+        log_message "INFO" "Resetting ownership of $homedir (some paths may be protected by SIP)"
+        chown_errors=$(mktemp -t chown_errors)
+        if chown -R "$username:staff" "$homedir" 2>"$chown_errors"; then
+            log_message "INFO" "chown completed"
+        elif grep -q "Operation not permitted" "$chown_errors"; then
+            log_message "WARN" "chown reported 'Operation not permitted' on protected files - safe to ignore"
         else
             log_message "ERROR" "chown failed with unexpected errors"
-            cat /tmp/chown_errors.log >> "$LOG_FILE"
+            cat "$chown_errors" >> "$LOG_FILE"
             migration_error=1
         fi
+        rm -f "$chown_errors"
+    else
+        log_message "WARN" "Skipping recursive chown: '$homedir' is not a folder named for $username"
+        migration_error=1
     fi
-    
-    # Add no access ACL for everyone group (default macOS-style access)
+
+    # Stock macOS home folder: drwxr-xr-x with an "everyone deny delete" ACL.
+    if chmod 755 "$homedir"; then
+        log_message "INFO" "Set home folder mode to 755"
+    else
+        log_message "ERROR" "Failed to set home folder mode"
+        migration_error=1
+    fi
     log_message "INFO" "Setting no access for everyone group on $homedir"
     if chmod +a "group:everyone deny delete" "$homedir"; then
         log_message "INFO" "Successfully set everyone group permissions"
@@ -470,13 +631,11 @@ else
     migration_error=1
 fi
 
-# Add user to the staff group on the Mac
-log_message "INFO" "Adding $username to the staff group..."
-if dseditgroup -o edit -a "$username" -t user staff; then
-    log_message "INFO" "Successfully added $username to staff group"
-else
-    log_message "ERROR" "Failed to add $username to staff group"
-    migration_error=1
+# A fresh account is NOT listed in the staff group (only root is); it is a member through
+# PrimaryGroupID 20. Remove a listing left by an earlier version of this script.
+if dscl . -read /Groups/staff GroupMembership 2>/dev/null | tr ' ' '\n' | grep -qx "$username"; then
+    log_message "INFO" "Removing explicit staff group listing for $username..."
+    dseditgroup -o edit -d "$username" -t user staff || { log_message "ERROR" "Failed to remove staff listing"; migration_error=1; }
 fi
 
 log_message "INFO" "Displaying user and group information for the $username account"
@@ -524,6 +683,31 @@ if dseditgroup -o checkmember -m "macadmin" awagent_enrolled | grep -q "yes"; th
 else
     log_message "INFO" "'macadmin' is not a member of awagent_enrolled. No action needed."
 fi
+
+# Compare with a fresh local account and report any difference.
+VerifyFreshAccount() {
+    local diffs=0 gid mode entry key
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] && is_ad_authority_entry "$entry" && { log_message "WARN" "Fresh-account check: AD entry remains in AuthenticationAuthority"; diffs=$((diffs + 1)); }
+    done < <(attr_values "$username" AuthenticationAuthority)
+    while IFS= read -r key; do
+        [[ -n "$key" ]] && is_ad_attribute_key "$key" && { log_message "WARN" "Fresh-account check: AD attribute remains: $key"; diffs=$((diffs + 1)); }
+    done < <(plist_keys "$(dscl -plist . -read "/Users/$username" 2>/dev/null)")
+    gid=$(dscl . -read /Users/"$username" PrimaryGroupID | awk '{print $2}')
+    [[ "$gid" == "20" ]] || { log_message "WARN" "Fresh-account check: PrimaryGroupID is $gid, expected 20"; diffs=$((diffs + 1)); }
+    if [[ -d "$homedir" ]]; then
+        mode=$(stat -f %Lp "$homedir")
+        [[ "$mode" == "755" ]] || { log_message "WARN" "Fresh-account check: home mode is $mode, expected 755"; diffs=$((diffs + 1)); }
+        ls -lde "$homedir" | grep -q "group:everyone deny delete" || { log_message "WARN" "Fresh-account check: home ACL missing"; diffs=$((diffs + 1)); }
+    fi
+    if [[ $diffs -eq 0 ]]; then
+        log_message "INFO" "Fresh-account check: $username matches a fresh local account"
+    else
+        log_message "WARN" "Fresh-account check: $diffs difference(s) found"
+    fi
+}
+VerifyFreshAccount
+CheckFileVaultIntact
 
 if [[ $migration_error -eq 0 ]]; then
     log_message "INFO" "Migration completed successfully. Creating marker file..."
