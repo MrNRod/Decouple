@@ -39,11 +39,12 @@ Only the steps the account needs are run, in this order:
 4. **Authentication authority:** remove only the AD entries (`LocalCachedUser`, AD `Kerberosv5`). `ShadowHash`, `SecureToken` and the local `@LKDC` Kerberos entry are never removed, so the local password and the FileVault login keep working. The run stops if the `SecureToken` or FileVault crypto-user entry disappears.
 5. **Attributes:** remove the AD attributes that are present (including `AppleMetaRecordName`, the AD distinguished name), the AD Kerberos values in `AltSecurityIdentities` and `user@DOMAIN` aliases in `RecordName`. An Apple Account's values are kept.
 6. **Policies and tickets:** clear AD-imposed password policies (also the history and last-login keys a mobile account carries) and destroy the user's Kerberos tickets.
-7. **Groups and shell:** set `PrimaryGroupID` to 20. The user is not listed in the `staff` group (only root is on a fresh account); an old listing is removed. With `GrantAdmin=true` the user is added to `admin`. The shell is set to `/bin/zsh` only if it is still the one AD assigned; a shell the user picked is kept.
-8. **Home folder:** owner and group `staff`, files that carry the old AD group moved to `staff`, and only the `everyone deny delete` ACL (stale domain ACLs are removed). The mode is left alone when it is stock (750 on macOS 27, 755 on accounts made by older macOS); anything else is set to 750.
-9. **Restart** Directory Services, then compare with a fresh local account again.
+7. **Groups and shell:** set `PrimaryGroupID` to 20. The user is not listed in the `staff` group (only root is on a fresh account); an old listing is removed. With `GrantAdmin=true` the user is added to `admin`. The shell is set to `/bin/zsh` only if it is still the one AD assigned; a shell the user picked is kept. The `_writers_` permissions a fresh account has for `AvatarRepresentation`, `inputSources` and `unlockOptions` are added, so the user can change their own picture, input sources and unlock options (permissions only, no data).
+8. **Restart** Directory Services, so the AD groups no longer resolve.
+9. **Home folder:** owner and group `staff`, and only the `everyone deny delete` ACL (stale domain ACLs are removed). Every item with the old AD primary group or any other group that no longer resolves (all AD groups, after the unbind) is moved to `staff`. `.CFUserTextEncoding` is set to 600. The mode is left alone when it is stock (750 on macOS 27, 755 on accounts made by older macOS); anything else is set to 750.
+10. **Compare** with a fresh local account again.
 
-The account keeps its UID.
+The account keeps its UID. Running the script again on a converted account is safe, and fixes items macOS services gave the old AD group again at the first login, so an MDM can run it once more after that login.
 
 ## Logging
 
@@ -64,6 +65,10 @@ sudo tests/collect_state.sh freshuser > /tmp/fresh.txt
 sudo tests/collect_state.sh <converted user> > /tmp/converted.txt
 tests/compare_state.sh /tmp/fresh.txt /tmp/converted.txt
 ```
+
+The compare leaves out what macOS sets through use rather than by account type: the Trash, APFS compression, the `com.apple.provenance` attribute, the `Library` hidden flag, `_writers_LinkedIdentity` (Apple Account) and record keys macOS adds with empty defaults.
+
+Live result (macOS 27, FileVault on): a converted mobile account logged in and unlocked FileVault after a reboot.
 
 Test on a disposable Mac first. Version history is in git.
 
