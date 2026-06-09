@@ -20,13 +20,14 @@ Upload the script to your MDM and set the variables in its execution environment
 | :--- | :--- | :--- |
 | `EnrollmentUser` | Yes | The short name of the account to convert. Use your MDM's variable (e.g., `$EnrollmentUser` in Workspace ONE). |
 | `GrantAdmin` | No | `true` adds the converted user to the `admin` group. Default: off, like a fresh local account. |
+| `VerifyOnly` | No | `true` only logs the differences from a fresh local account and changes nothing. |
 
 ### Exit codes
 | Code | Meaning |
 | :--- | :--- |
 | `0` | Done, or nothing to do. |
 | `1` | Stopped: not root, invalid or missing user, the backup failed, or the FileVault guard tripped. |
-| `2` | Finished, but the account still differs from a fresh local account (see the log). |
+| `2` | Finished, but the account still differs from a fresh local account (see the log). With `VerifyOnly=true`: differences were found. |
 
 ## What it does
 
@@ -36,10 +37,10 @@ Only the steps the account needs are run, in this order:
 2. **Back up** the account record to `/var/log/mobile_to_local_backup_<user>_<time>.plist` (root-only, no password hash).
 3. **Unbind** the Mac from AD (with retries and a check), remove AD from the search paths and set the search policy back to Automatic.
 4. **Authentication authority:** remove only the AD entries (`LocalCachedUser`, AD `Kerberosv5`). `ShadowHash`, `SecureToken` and the local `@LKDC` Kerberos entry are never removed, so the local password and the FileVault login keep working. The run stops if the `SecureToken` or FileVault crypto-user entry disappears.
-5. **Attributes:** remove the AD attributes that are present, the AD Kerberos values in `AltSecurityIdentities` and `user@DOMAIN` aliases in `RecordName`. An Apple Account's values are kept.
-6. **Policies and tickets:** clear AD-imposed password policies and destroy the user's Kerberos tickets.
-7. **Groups:** set `PrimaryGroupID` to 20. The user is not listed in the `staff` group (only root is on a fresh account); an old listing is removed. With `GrantAdmin=true` the user is added to `admin`.
-8. **Home folder:** owner and group `staff`, files that carry the old AD group moved to `staff`, mode 755, and only the `everyone deny delete` ACL (stale domain ACLs are removed).
+5. **Attributes:** remove the AD attributes that are present (including `AppleMetaRecordName`, the AD distinguished name), the AD Kerberos values in `AltSecurityIdentities` and `user@DOMAIN` aliases in `RecordName`. An Apple Account's values are kept.
+6. **Policies and tickets:** clear AD-imposed password policies (also the history and last-login keys a mobile account carries) and destroy the user's Kerberos tickets.
+7. **Groups and shell:** set `PrimaryGroupID` to 20. The user is not listed in the `staff` group (only root is on a fresh account); an old listing is removed. With `GrantAdmin=true` the user is added to `admin`. The shell is set to `/bin/zsh` only if it is still the one AD assigned; a shell the user picked is kept.
+8. **Home folder:** owner and group `staff`, files that carry the old AD group moved to `staff`, and only the `everyone deny delete` ACL (stale domain ACLs are removed). The mode is left alone when it is stock (750 on macOS 27, 755 on accounts made by older macOS); anything else is set to 750.
 9. **Restart** Directory Services, then compare with a fresh local account again.
 
 The account keeps its UID.
@@ -56,7 +57,15 @@ Tests for the parsing and filtering helpers, and for the detection logic against
 /bin/bash tests/test_filters.sh
 ```
 
-This has not been run against a real AD-bound Mac. Test on a disposable one first. Version history is in git.
+To compare a converted account with a fresh local account made in System Settings (read-only, needs root; the snapshots contain no password hashes or keys):
+
+```
+sudo tests/collect_state.sh freshuser > /tmp/fresh.txt
+sudo tests/collect_state.sh <converted user> > /tmp/converted.txt
+tests/compare_state.sh /tmp/fresh.txt /tmp/converted.txt
+```
+
+Test on a disposable Mac first. Version history is in git.
 
 ## Credits
 
