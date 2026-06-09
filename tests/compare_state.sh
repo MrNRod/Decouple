@@ -11,8 +11,11 @@ if [[ ! -r "$fresh" || ! -r "$converted" ]]; then
     exit 2
 fi
 
-# Keys whose values must differ between two accounts: names, picture, shell history.
-IGNORE='^record\.dsAttrTypeStandard:(RealName|Picture|JPEGPhoto)$|^item\.\.(zsh|bash)_(history|sessions)\.'
+# Keys whose values must differ between two accounts: names, picture, shell history. Also what
+# macOS sets through use and the migration leaves alone: the Trash, the Apple Account writer, and
+# keys macOS adds with empty defaults the first time a pane is opened.
+IGNORE='^record\.dsAttrTypeStandard:(RealName|Picture|JPEGPhoto|AuthenticationHint)$|^item\.\.(zsh|bash)_(history|sessions)\.'
+IGNORE+='|^item\.\.Trash\.|^record\.dsAttrTypeNative:(_writers_LinkedIdentity|AvatarRepresentation|inputSources|unlockOptions)$'
 
 differences=$(awk -v ignore="$IGNORE" '
     FNR == 1 { file++ }
@@ -21,6 +24,15 @@ differences=$(awk -v ignore="$IGNORE" '
         key = substr($0, 1, index($0, " = ") - 1)
         value = substr($0, index($0, " = ") + 3)
         if (key ~ ignore || key ~ /^system\./) next
+        # Set by macOS, not by the account type: APFS compression, the download-provenance xattr,
+        # and the Library hidden flag (Finder toggles it).
+        if (key ~ /\.flags$/) {
+            gsub(/(^|,)compressed/, "", value)
+            if (key == "item.Library.flags") gsub(/(^|,)hidden/, "", value)
+            sub(/^,/, "", value)
+            if (value == "") value = "-"
+        }
+        if (key == "home.xattrs") gsub(/com\.apple\.provenance ?/, "", value)
         if (file == 1) a[key SUBSEP value] = 1; else b[key SUBSEP value] = 1
     }
     END {
