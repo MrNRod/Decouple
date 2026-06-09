@@ -141,8 +141,8 @@ dseditgroup() { [[ "$*" == "-o checkmember -m jdoe netaccounts" ]] && echo "yes 
 username=jdoe; homedir=/nonexistent/jdoe
 expected="This Mac is still bound to Active Directory
 Active Directory is still in the search path
-AuthenticationAuthority has an AD entry
-AuthenticationAuthority has an AD entry
+AuthenticationAuthority has an AD entry: Kerberosv5
+AuthenticationAuthority has an AD entry: LocalCachedUser
 AD attribute remains: dsAttrTypeStandard:CachedGroups
 AltSecurityIdentities has an AD Kerberos principal
 RecordName has a domain alias: jdoe@corp.example.com
