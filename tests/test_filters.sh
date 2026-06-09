@@ -9,7 +9,7 @@ helpers=$(sed -n '/^# BEGIN helpers/,/^# END helpers/p;/^# BEGIN readonly checks
 [[ -n "$helpers" ]] || { echo "Could not find the helpers block in $SCRIPT"; exit 2; }
 eval "$helpers"
 # A missing function must fail loudly instead of reading as "not flagged".
-for fn in attr_values_from_plist plist_keys record_values search_paths extra_policy_keys plist_value_as_xml account_policy_xml is_ad_shell is_stock_home_mode home_acl_is_stock is_enabled is_ad_search_path find_differences is_bound in_group is_ad_authority_entry is_ad_alt_identity is_domain_alias is_ad_attribute_key; do
+for fn in attr_values_from_plist plist_keys record_values search_paths extra_policy_keys plist_value_as_xml account_policy_xml is_ad_shell is_stock_home_mode missing_writers home_acl_is_stock is_enabled is_ad_search_path find_differences is_bound in_group is_ad_authority_entry is_ad_alt_identity is_domain_alias is_ad_attribute_key; do
     declare -F "$fn" >/dev/null || { echo "helper not loaded: $fn"; exit 2; }
 done
 
@@ -107,6 +107,17 @@ check "750 is stock" yes "$(truthy is_stock_home_mode 750)"
 check "755 is stock" yes "$(truthy is_stock_home_mode 755)"
 for m in 700 775 777 751; do check "$m is not stock" no "$(truthy is_stock_home_mode $m)"; done
 
+# --- writer permissions: only the missing ones are named
+check "all writers missing" "AvatarRepresentation
+inputSources
+unlockOptions" "$(missing_writers "dsAttrTypeStandard:RecordName")"
+check "one writer missing" "inputSources" "$(missing_writers "dsAttrTypeNative:_writers_AvatarRepresentation
+dsAttrTypeNative:_writers_unlockOptions
+dsAttrTypeNative:_writers_LinkedIdentity")"
+check "a longer key doesn't count" "unlockOptions" "$(missing_writers "dsAttrTypeNative:_writers_AvatarRepresentation
+dsAttrTypeNative:_writers_inputSources
+dsAttrTypeNative:_writers_unlockOptionsX")"
+
 # --- search paths and the GrantAdmin switch
 check "AD search path"     yes "$(truthy is_ad_search_path '/Active Directory/All Domains')"
 check "domain search path" yes "$(truthy is_ad_search_path '/Active Directory/CORP/corp.example.com')"
@@ -138,12 +149,23 @@ dscl() {
 }
 dsconfigad() { echo "Active Directory Domain = corp.example.com"; }
 dseditgroup() { [[ "$*" == "-o checkmember -m jdoe netaccounts" ]] && echo "yes jdoe is a member of netaccounts"; }
-username=jdoe; homedir=/nonexistent/jdoe
+# A stock home folder, except for the mobile account's .CFUserTextEncoding mode. Files with a group
+# that doesn't resolve can't be made without root, so find is stubbed for -nogroup only.
+fixture_home=$(mktemp -d)
+trap 'chmod -N "$fixture_home/jdoe" 2>/dev/null; rm -rf "$fixture_home"' EXIT
+homedir="$fixture_home/jdoe"
+mkdir "$homedir" && chgrp staff "$homedir" && chmod 750 "$homedir" && chmod +a "group:everyone deny delete" "$homedir"
+( umask 377; : > "$homedir/.CFUserTextEncoding" )
+find() { [[ "$*" == "$homedir -xdev -nogroup" ]] && printf '%s\n' "$homedir/Library/a" "$homedir/Library/b"; }
+username=jdoe
 expected="This Mac is still bound to Active Directory
 Active Directory is still in the search path
 AuthenticationAuthority has an AD entry: Kerberosv5
 AuthenticationAuthority has an AD entry: LocalCachedUser
 AD attribute remains: dsAttrTypeStandard:CachedGroups
+The record has no _writers_AvatarRepresentation; on a fresh account the user can change AvatarRepresentation
+The record has no _writers_inputSources; on a fresh account the user can change inputSources
+The record has no _writers_unlockOptions; on a fresh account the user can change unlockOptions
 AltSecurityIdentities has an AD Kerberos principal
 RecordName has a domain alias: jdoe@corp.example.com
 PrimaryGroupID is 12, a fresh account uses 20
@@ -151,9 +173,12 @@ UserShell is /bin/bash (set by AD), a fresh account uses /bin/zsh
 The user is in netaccounts (network account); a fresh account is in localaccounts
 Account policy still has AD rules
 The admin group has nested (AD) groups
-The user is listed in the staff group; on a fresh account only root is"
+The user is listed in the staff group; on a fresh account only root is
+2 item(s) in the home folder still have an AD group
+.CFUserTextEncoding mode is 400, a fresh account uses 600"
 check "mobile account: every difference reported" "$expected" "$(find_differences)"
-unset -f dscl dsconfigad dseditgroup plist_doc
+unset -f dscl dsconfigad dseditgroup plist_doc find
+check "real find: a stock home folder has no item without a group" "" "$(find "$homedir" -xdev -nogroup)"
 
 # --- real, unmodified local account on this Mac: nothing may be flagged
 if [[ "${1:-}" != "--no-live" ]] && u=$(stat -f%Su /dev/console) && dscl . -read "/Users/$u" &>/dev/null; then
@@ -168,7 +193,7 @@ if [[ "${1:-}" != "--no-live" ]] && u=$(stat -f%Su /dev/console) && dscl . -read
     homedir=$(dscl . -read "/Users/$u" NFSHomeDirectory | sed 's/^NFSHomeDirectory: //')
     check "live account: find_differences is empty" "" "$(find_differences)"
     # Positive controls: the same call form must return real data for a key that exists.
-    check "live: record_values reads real group data" yes "$(record_values /Groups/admin GroupMembership | grep -qx root && echo yes)"
+    check "live: record_values reads real group data" yes "$(record_values /Groups/admin GroupMembership | grep -x root >/dev/null && echo yes)"
     check "live: in_group finds root in staff" yes "$(truthy in_group staff root)"
     check "live: in_group rejects a non-member" no "$(truthy in_group staff "$u")"
     check "live account: admin NestedGroups absent (dscl exits 0 for a missing key)" "" "$(record_values /Groups/admin NestedGroups)"
