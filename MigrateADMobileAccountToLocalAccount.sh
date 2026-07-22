@@ -535,6 +535,8 @@ FixHomeFolder() {
 RestartDirectoryServices() {
     local waited=0
     killall opendirectoryd &>/dev/null
+    # Flush the DS cache so `id` shows the new groups immediately, not the cached AD ones.
+    dscacheutil -flushcache &>/dev/null
     # Wait for the account to be readable again instead of sleeping a fixed time.
     while [[ $waited -lt 30 ]] && ! dscl . -read "/Users/$username" UniqueID &>/dev/null; do
         sleep 1
