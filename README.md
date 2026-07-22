@@ -44,7 +44,18 @@ Only the steps the account needs are run, in this order:
 9. **Home folder:** owner and group `staff`, and only the `everyone deny delete` ACL (stale domain ACLs are removed). Every item with the old AD primary group or any other group that no longer resolves (all AD groups, after the unbind) is moved to `staff`. `.CFUserTextEncoding` is set to 600. The mode is left alone when it is stock (750 on macOS 27, 755 on accounts made by older macOS); anything else is set to 750.
 10. **Compare** with a fresh local account again.
 
-The account keeps its UID. Running the script again on a converted account is safe, and fixes items macOS services gave the old AD group again at the first login, so an MDM can run it once more after that login.
+The account keeps its UID.
+
+### Known limitation: Local KDC (Kerberos)
+
+A fresh local account has a `Kerberosv5` entry for the Local KDC (LKDC), plus `KerberosKeys` and
+`HeimdalSRPKey`. A converted mobile account doesn't, because these are created by the LKDC when the
+password is set — and the mobile account's password was set by Active Directory, not the local KDC.
+
+The account works without them: login, FileVault unlock, and the login keychain all use the preserved
+`ShadowHash` and `SecureToken`. The only thing missing is Kerberos single sign-on for local services
+(screen sharing, AFP, etc.). To add it, the user changes their password once in System Settings after
+the migration. The LKDC then creates the missing entries. Running the script again on a converted account is safe, and fixes items macOS services gave the old AD group again at the first login, so an MDM can run it once more after that login.
 
 ## Logging
 
@@ -69,6 +80,16 @@ tests/compare_state.sh /tmp/fresh.txt /tmp/converted.txt
 The compare leaves out what macOS sets through use rather than by account type: the Trash, APFS compression, the `com.apple.provenance` attribute, the `Library` hidden flag, `_writers_LinkedIdentity` (Apple Account) and record keys macOS adds with empty defaults.
 
 Live result (macOS 27, FileVault on): a converted mobile account logged in and unlocked FileVault after a reboot.
+
+### Live result
+
+Tested on macOS 27 (FileVault on): a mobile AD account was converted, logged in, and unlocked
+FileVault after a reboot. After a second run (to clean up files macOS services re-grouped at the
+first login), the account matched a fresh local account. The only remaining differences were the
+Local KDC entries (see the known limitation above) and a macOS daemon file — neither is an AD trace.
+
+Run the script again after the user's first login to clean up files that macOS services give the
+old AD group. An MDM can do this with a second deployment.
 
 Test on a disposable Mac first. Version history is in git.
 
