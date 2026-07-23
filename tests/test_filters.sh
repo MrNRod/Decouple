@@ -1,8 +1,8 @@
 #!/bin/bash
-# Unit tests for the pure helpers in MigrateADMobileAccountToLocalAccount.sh.
+# Unit tests for the pure helpers in decouple.sh.
 # Read-only: nothing here changes the system. Run with /bin/bash (3.2) to match macOS.
 #   /bin/bash tests/test_filters.sh
-SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/MigrateADMobileAccountToLocalAccount.sh"
+SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/decouple.sh"
 # Load only the helpers between the markers; the rest of the script would run a migration.
 # (bash 3.2 can't `source <(...)`, so use eval.)
 helpers=$(sed -n '/^# BEGIN helpers/,/^# END helpers/p;/^# BEGIN readonly checks/,/^# END readonly checks/p' "$SCRIPT")
