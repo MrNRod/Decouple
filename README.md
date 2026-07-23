@@ -21,6 +21,7 @@ Upload the script to your MDM and set the variables in its execution environment
 | `EnrollmentUser` | Yes | The short name of the account to convert. Use your MDM's variable (e.g., `$EnrollmentUser` in Workspace ONE). |
 | `GrantAdmin` | No | `true` adds the converted user to the `admin` group. Default: off, like a fresh local account. |
 | `VerifyOnly` | No | `true` only logs the differences from a fresh local account and changes nothing. |
+| `UseDialog` | No | `true` shows progress in swiftDialog if `/usr/local/bin/dialog` is installed. Default: off, runs headless. |
 
 ### Exit codes
 | Code | Meaning |
