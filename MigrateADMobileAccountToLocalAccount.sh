@@ -54,6 +54,8 @@ dialog_start() { # $1 = title, $2 = message, rest = step names
         --moveable --ontop --hidedefaultkeyboardaction \
         "${list_args[@]}" &>/dev/null &
     DIALOG_PID=$!
+    # Give swiftDialog time to open the command file before we write to it.
+    sleep 1
 }
 
 dialog_step() { # $1 = index (0-based), $2 = status (wait/success/error/fail), $3 = text
@@ -661,6 +663,7 @@ if [[ -z "$differences" ]]; then
     if [[ $DIALOG_ENABLED -eq 1 ]]; then
         dialog_start "AD to Local: $username" "No Active Directory traces found." "Check Account"
         dialog_step 0 success "Already a local account"
+        dialog_progress 1 "Already a local account"
         dialog_finish "Already a Local Account" "No Active Directory traces were found. Nothing to change."
         wait "$DIALOG_PID" 2>/dev/null
         dialog_close
