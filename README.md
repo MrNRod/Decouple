@@ -106,8 +106,6 @@ Test on a disposable Mac first. Version history is in git.
 
 ## Credits
 
-- Originally based on `MigrateUserHomeToDomainAcct.sh` by [Patrick Gallagher](https://twitter.com/patgmac).
-- Guidance and inspiration from [Lisa Davies](http://lisacherie.com/?p=239).
-- Modified by [Rich Trouton](https://github.com/rtrouton/rtrouton_scripts/tree/main/rtrouton_scripts/migrate_ad_mobile_account_to_local_account).
-- Thanks to Rick Lemmon for the suggested changes to the AD unbind process, and to the anonymous reporter who provided the macOS 10.14.4 `ShadowHashData` bug report and fix.
-- Modified by Noel Rodriguez-Lebron.
+This script is a modified version of [Rich Trouton's](https://github.com/rtrouton/rtrouton_scripts/tree/main/rtrouton_scripts/migrate_ad_mobile_account_to_local_account) `MigrateADMobileAccounttoLocalAccount.command`, which was itself a modified version of `MigrateUserHomeToDomainAcct.sh` by [Patrick Gallagher](https://twitter.com/patgmac), written with guidance from [Lisa Davies](http://lisacherie.com/?p=239). Rick Lemmon suggested changes to the AD unbind process, and an anonymous reporter provided the macOS 10.14.4 `ShadowHashData` bug report and fix — both contributions to Rich Trouton's version.
+
+Modified for modern macOS by Noel Rodriguez-Lebron.
