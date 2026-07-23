@@ -28,7 +28,8 @@ dialog_init() {
     # No GUI at the login window.
     local console_user; console_user=$(stat -f%Su /dev/console 2>/dev/null)
     [[ "$console_user" != "loginwindow" && -n "$console_user" ]] || { log_message "INFO" "No console user; running headless"; return 0; }
-    DIALOG_CMD_FILE=$(mktemp -t adtl_dialog)
+    DIALOG_CMD_FILE="/var/tmp/adtl_dialog_${username}_$$.log"
+    : > "$DIALOG_CMD_FILE"
     chmod 644 "$DIALOG_CMD_FILE"
     DIALOG_ENABLED=1
 }
@@ -40,7 +41,6 @@ dialog_start() { # $1 = title, $2 = message, rest = step names
     for step in "$@"; do
         list_args+=( --listitem "$step" )
     done
-    : > "$DIALOG_CMD_FILE"
     local console_user console_uid
     console_user=$(stat -f%Su /dev/console)
     console_uid=$(id -u "$console_user")
