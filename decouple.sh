@@ -5,9 +5,9 @@
 # UseDialog=true (optional) shows progress in swiftDialog if /usr/local/bin/dialog is installed.
 # Exit codes: 0 done (or nothing to do), 1 stopped, 2 differences from a fresh account remain (or VerifyOnly found some).
 # See the README for usage and credits.
-Version=2.0
+Version=2.0  # Decouple
 
-LOG_FILE="/var/log/mobile_to_local_migration.log"
+LOG_FILE="/var/log/decouple.log"
 
 # Levels: INFO = what happened, WARN = a problem the run continues past, ERROR = the run stopped.
 log_message() {
@@ -379,7 +379,7 @@ CheckFileVaultIntact() {
 # password are never included.
 BackupAccountRecord() {
     local file key
-    file="/var/log/mobile_to_local_backup_${username}_$(date +%s).plist"
+    file="/var/log/decouple_backup_${username}_$(date +%s).plist"
     if ( umask 077; dscl -plist . -read "/Users/$username" > "$file" ); then
         for key in ShadowHashData KerberosKeys HeimdalSRPKey; do
             plutil -remove "dsAttrTypeNative:$key" "$file" 2>/dev/null
@@ -633,7 +633,7 @@ if [[ $EUID -ne 0 ]]; then
     echo "This script must be run as root."
     exit 1
 fi
-[[ -e "$LOG_FILE" ]] || ( umask 077; : > "$LOG_FILE" )
+[[ -e "$LOG_FILE" ]] || ( umask 022; : > "$LOG_FILE" )
 
 username=$EnrollmentUser
 GrantAdmin=${GrantAdmin:-false}
@@ -649,7 +649,7 @@ if ! dscl . -read "/Users/$username" &>/dev/null; then
     exit 1
 fi
 
-log_message "INFO" "MigrateADMobileAccountToLocalAccount $Version: $username, macOS $(sw_vers -productVersion)"
+log_message "INFO" "Decouple $Version: $username, macOS $(sw_vers -productVersion)"
 dialog_init
 
 uid=$(id -u "$username")
