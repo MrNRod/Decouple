@@ -2,46 +2,101 @@
 
 ## Description
 
-The AD Account Migration script is a utility script that allows you to migrate an Active Directory (AD) mobile account to a local account on macOS. This is useful for detaching a machine from AD while preserving the user's home directory and settings.
+The AD Account Migration script converts an Active Directory (AD) mobile account on macOS into a local account that matches a fresh local account. This is useful for detaching a Mac from AD while preserving the user's home folder and settings. It does the same work as the ADToLocal app.
 
 ## Usage
 
-### Terminal
-To run the script manually via terminal, you must execute it as root and provide the target username via the `EnrollmentUser` environment variable:
+The script must run as root. It changes nothing and exits if the account already matches a fresh local account.
 
+### Terminal
 ```bash
 sudo EnrollmentUser="username" ./MigrateADMobileAccountToLocalAccount.sh
 ```
 
 ### MDM (Mobile Device Management)
-Upload the script to your MDM provider. You must configure the execution environment to set the `EnrollmentUser` variable to the username of the account to be migrated.
-- **Variable Name:** `EnrollmentUser`
-- **Value:** Set this to the console variable that matches your end user's name (e.g., `$EnrollmentUser` in Workspace ONE).
+Upload the script to your MDM and set the variables in its execution environment.
 
-## Functionality
+| Variable | Required | Description |
+| :--- | :--- | :--- |
+| `EnrollmentUser` | Yes | The short name of the account to convert. Use your MDM's variable (e.g., `$EnrollmentUser` in Workspace ONE). |
+| `GrantAdmin` | No | `true` adds the converted user to the `admin` group. Default: off, like a fresh local account. |
+| `VerifyOnly` | No | `true` only logs the differences from a fresh local account and changes nothing. |
 
-The script performs the following actions:
+### Exit codes
+| Code | Meaning |
+| :--- | :--- |
+| `0` | Done, or nothing to do. |
+| `1` | Stopped: not root, invalid or missing user, the backup failed, or the FileVault guard tripped. |
+| `2` | Finished, but the account still differs from a fresh local account (see the log). With `VerifyOnly=true`: differences were found. |
 
-### Checks
-- Verifies if the migration has already completed (checks for `/var/db/.mobile_to_local_migration_done`).
-- Checks if the target user exists.
-- Checks if the device is bound to Active Directory.
-- Verifies if the target account is an AD mobile account.
+## What it does
 
-### Changes
-- **Unbinds AD:** Forcefully unbinds the Mac from Active Directory and removes AD from search paths.
-- **Attribute Removal:** Removes AD-specific attributes from the user's local record (e.g., `cached_groups`, `OriginalNodeName`, `CopyTimestamp`).
-- **Password Migration:** Modifies the `AuthenticationAuthority` to remove Kerberos and LocalCachedUser entries, effectively converting the password to a local shadow hash.
-- **Permissions:**
-  - Removes stale ACLs from the home directory.
-  - Resets ownership of the home directory to the user and the `staff` group.
-  - Sets "deny delete" permissions for the `everyone` group.
-- **Group Membership:**
-  - Adds the user to the `staff` group.
-  - Adds the user to the `awagent_enrolled` group (Workspace ONE).
-  - Removes `macadmin` from `awagent_enrolled` if present.
-- **Admin Rights:** Automatically grants admin rights to the migrated user.
+Only the steps the account needs are run, in this order:
 
-### Logging
-- Logs all actions to `/var/log/mobile_to_local_migration.log`.
-- Creates a marker file `/var/db/.mobile_to_local_migration_done` upon successful completion to prevent re-running.
+1. **Compare** the account with a fresh local account. Nothing to fix means nothing is changed.
+2. **Back up** the account record to `/var/log/mobile_to_local_backup_<user>_<time>.plist` (root-only, no password hash).
+3. **Unbind** the Mac from AD (with retries and a check), remove AD from the search paths and set the search policy back to Automatic.
+4. **Authentication authority:** remove only the AD entries (`LocalCachedUser`, AD `Kerberosv5`). `ShadowHash`, `SecureToken` and the local `@LKDC` Kerberos entry are never removed, so the local password and the FileVault login keep working. The run stops if the `SecureToken` or FileVault crypto-user entry disappears.
+5. **Attributes:** remove the AD attributes that are present (including `AppleMetaRecordName`, the AD distinguished name), the AD Kerberos values in `AltSecurityIdentities` and `user@DOMAIN` aliases in `RecordName`. An Apple Account's values are kept.
+6. **Policies and tickets:** clear AD-imposed password policies (also the history and last-login keys a mobile account carries) and destroy the user's Kerberos tickets.
+7. **Groups and shell:** set `PrimaryGroupID` to 20. The user is not listed in the `staff` group (only root is on a fresh account); an old listing is removed. With `GrantAdmin=true` the user is added to `admin`. The shell is set to `/bin/zsh` only if it is still the one AD assigned; a shell the user picked is kept. The `_writers_` permissions a fresh account has for `AvatarRepresentation`, `inputSources` and `unlockOptions` are added, so the user can change their own picture, input sources and unlock options (permissions only, no data).
+8. **Restart** Directory Services, so the AD groups no longer resolve.
+9. **Home folder:** owner and group `staff`, and only the `everyone deny delete` ACL (stale domain ACLs are removed). Every item with the old AD primary group or any other group that no longer resolves (all AD groups, after the unbind) is moved to `staff`. `.CFUserTextEncoding` is set to 600. The mode is left alone when it is stock (750 on macOS 27, 755 on accounts made by older macOS); anything else is set to 750.
+10. **Compare** with a fresh local account again.
+
+The account keeps its UID.
+
+### Known limitation: Local KDC (Kerberos)
+
+A fresh local account has a `Kerberosv5` entry for the Local KDC (LKDC), plus `KerberosKeys` and
+`HeimdalSRPKey`. A converted mobile account doesn't, because these are created by the LKDC when the
+password is set — and the mobile account's password was set by Active Directory, not the local KDC.
+
+The account works without them: login, FileVault unlock, and the login keychain all use the preserved
+`ShadowHash` and `SecureToken`. The only thing missing is Kerberos single sign-on for local services
+(screen sharing, AFP, etc.). To add it, the user changes their password once in System Settings after
+the migration. The LKDC then creates the missing entries. Running the script again on a converted account is safe, and fixes items macOS services gave the old AD group again at the first login, so an MDM can run it once more after that login.
+
+## Logging
+
+Everything is logged to `/var/log/mobile_to_local_migration.log` (root-only) and to the console, one line per action. There are three levels: `INFO` (what happened), `WARN` (a problem the run continues past) and `ERROR` (the run stopped).
+
+## Testing
+
+Tests for the parsing and filtering helpers, and for the detection logic against a stubbed mobile account and this Mac's real account (read-only). Run with the macOS bash:
+
+```
+/bin/bash tests/test_filters.sh
+```
+
+To compare a converted account with a fresh local account made in System Settings (read-only, needs root; the snapshots contain no password hashes or keys):
+
+```
+sudo tests/collect_state.sh freshuser > /tmp/fresh.txt
+sudo tests/collect_state.sh <converted user> > /tmp/converted.txt
+tests/compare_state.sh /tmp/fresh.txt /tmp/converted.txt
+```
+
+The compare leaves out what macOS sets through use rather than by account type: the Trash, APFS compression, the `com.apple.provenance` attribute, the `Library` hidden flag, `_writers_LinkedIdentity` (Apple Account) and record keys macOS adds with empty defaults.
+
+Live result (macOS 27, FileVault on): a converted mobile account logged in and unlocked FileVault after a reboot.
+
+### Live result
+
+Tested on macOS 27 (FileVault on): a mobile AD account was converted, logged in, and unlocked
+FileVault after a reboot. After a second run (to clean up files macOS services re-grouped at the
+first login), the account matched a fresh local account. The only remaining differences were the
+Local KDC entries (see the known limitation above) and a macOS daemon file — neither is an AD trace.
+
+Run the script again after the user's first login to clean up files that macOS services give the
+old AD group. An MDM can do this with a second deployment.
+
+Test on a disposable Mac first. Version history is in git.
+
+## Credits
+
+- Originally based on `MigrateUserHomeToDomainAcct.sh` by [Patrick Gallagher](https://twitter.com/patgmac).
+- Guidance and inspiration from [Lisa Davies](http://lisacherie.com/?p=239).
+- Modified by [Rich Trouton](https://github.com/rtrouton/rtrouton_scripts/tree/main/rtrouton_scripts/migrate_ad_mobile_account_to_local_account).
+- Thanks to Rick Lemmon for the suggested changes to the AD unbind process, and to the anonymous reporter who provided the macOS 10.14.4 `ShadowHashData` bug report and fix.
+- Modified by Noel Rodriguez-Lebron.
