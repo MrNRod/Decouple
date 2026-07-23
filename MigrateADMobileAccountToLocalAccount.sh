@@ -635,6 +635,7 @@ fi
 username=$EnrollmentUser
 GrantAdmin=${GrantAdmin:-false}
 VerifyOnly=${VerifyOnly:-false}
+UseDialog=${UseDialog:-false}
 
 if [[ ! "$username" =~ ^[A-Za-z0-9._-]{1,64}$ || "$username" == -* ]]; then
     log_message "ERROR" "Invalid target user name: '$username'"
@@ -646,6 +647,7 @@ if ! dscl . -read "/Users/$username" &>/dev/null; then
 fi
 
 log_message "INFO" "MigrateADMobileAccountToLocalAccount $Version: $username, macOS $(sw_vers -productVersion)"
+dialog_init
 
 uid=$(id -u "$username")
 homedir=$(dscl . -read "/Users/$username" NFSHomeDirectory | sed 's/^NFSHomeDirectory: //')
@@ -656,6 +658,13 @@ ad_shell=$(record_values "/Users/$username" dsAttrTypeNative:original_shell)
 differences=$(find_differences)
 if [[ -z "$differences" ]]; then
     log_message "INFO" "No Active Directory traces found. Nothing to do."
+    if [[ $DIALOG_ENABLED -eq 1 ]]; then
+        dialog_start "AD to Local: $username" "No Active Directory traces found." "Check Account"
+        dialog_step 0 success "Already a local account"
+        dialog_finish "Already a Local Account" "No Active Directory traces were found. Nothing to change."
+        wait "$DIALOG_PID" 2>/dev/null
+        dialog_close
+    fi
     exit 0
 fi
 while IFS= read -r line; do
@@ -663,6 +672,14 @@ while IFS= read -r line; do
 done <<<"$differences"
 if is_enabled "$VerifyOnly"; then
     log_message "INFO" "Verify only: nothing was changed"
+    if [[ $DIALOG_ENABLED -eq 1 ]]; then
+        dialog_start "AD to Local: $username" "Differences found (verify only, nothing changed)." \
+            "Verify Only" "$differences"
+        dialog_finish "Verify Only" "$(printf '%s\n' "$differences" | head -5)... See the log for details."
+        # Wait for the user to close the dialog.
+        wait "$DIALOG_PID" 2>/dev/null
+        dialog_close
+    fi
     exit 2
 fi
 
@@ -673,18 +690,58 @@ while IFS= read -r entry; do
     is_ad_authority_entry "$entry" && was_mobile=1
 done < <(record_values "/Users/$username" AuthenticationAuthority)
 
+# Build the step list for the dialog (only the steps that will actually run).
+dialog_steps=()
+dialog_steps+=("Back Up Account Record")
+[[ $was_bound -eq 1 ]] && dialog_steps+=("Unbind from Active Directory")
+[[ $was_bound -eq 1 || "$differences" == *"in the search path"* ]] && dialog_steps+=("Clean Search Paths")
+[[ $was_mobile -eq 1 ]] && dialog_steps+=("Remove AD Authentication Entries")
+dialog_steps+=("Remove AD Attributes")
+dialog_steps+=("Remove AD Kerberos Identities")
+dialog_steps+=("Remove Domain Aliases")
+dialog_steps+=("Clear AD Password Policies")
+[[ $was_mobile -eq 1 ]] && dialog_steps+=("Destroy Kerberos Tickets")
+dialog_steps+=("Reset Groups and Shell")
+dialog_steps+=("Restart Directory Services")
+dialog_steps+=("Fix Home Folder")
+dialog_steps+=("Verify Against Fresh Account")
+
+dialog_start "AD to Local: $username" "Converting $username to a local account. Do not restart or power off." "${dialog_steps[@]}"
+
+# Track the current step index for dialog updates.
+di=0
+dialog_running() { dialog_step "$di" wait "$1"; }
+dialog_done()    { dialog_step "$di" success "$1"; dialog_progress "$((di + 1))" "$2"; di=$((di + 1)); }
+dialog_warn()    { dialog_step "$di" error "$1"; dialog_progress "$((di + 1))" "$2"; di=$((di + 1)); }
+
+dialog_running "Backing up..."
 CaptureFileVaultState
 BackupAccountRecord
+dialog_done "Backed up" "Back Up Account Record"
 
-[[ $was_bound -eq 1 ]] && UnbindFromAD
-[[ $was_bound -eq 1 || "$differences" == *"in the search path"* ]] && ResetSearchPaths
+if [[ $was_bound -eq 1 ]]; then
+    dialog_running "Unbinding..."
+    UnbindFromAD
+    dialog_done "Unbound" "Unbind from Active Directory"
+fi
+if [[ $was_bound -eq 1 || "$differences" == *"in the search path"* ]]; then
+    dialog_running "Cleaning search paths..."
+    ResetSearchPaths
+    dialog_done "Search paths cleaned" "Clean Search Paths"
+fi
 if [[ $was_mobile -eq 1 ]]; then
+    dialog_running "Removing AD authority entries..."
     RemoveMatchingValues AuthenticationAuthority is_ad_authority_entry
     CheckFileVaultIntact
+    dialog_done "AD entries removed" "Remove AD Authentication Entries"
 fi
+dialog_running "Removing AD attributes..."
 RemoveADAttributes
 RemoveMatchingValues AltSecurityIdentities is_ad_alt_identity
 RemoveMatchingValues RecordName is_domain_alias
+dialog_done "Attributes removed" "Remove AD Attributes and Identities"
+
+dialog_running "Clearing policies and tickets..."
 ClearAccountPolicies
 [[ $was_mobile -eq 1 ]] && DestroyKerberosTickets
 RemoveStaffListing
@@ -692,19 +749,33 @@ GrantAdminRights
 ResetPrimaryGroup
 ResetShell
 AddWriterPermissions
+dialog_done "Groups and shell reset" "Reset Groups and Shell"
 
-# Record changes are done. Restart first so the AD groups no longer resolve, then fix the files.
+dialog_running "Restarting Directory Services..."
 RestartDirectoryServices
-FixHomeFolder
+dialog_done "Restarted" "Restart Directory Services"
 
+dialog_running "Fixing home folder..."
+FixHomeFolder
+dialog_done "Home folder fixed" "Fix Home Folder"
+
+dialog_running "Verifying..."
 remaining=$(find_differences)
 CheckFileVaultIntact
 if [[ -z "$remaining" ]]; then
     log_message "INFO" "Done: $username matches a fresh local account"
+    dialog_done "Matches a fresh account" "Verify Against Fresh Account"
+    dialog_finish "Migration Successful" "$username is now a local account. Restart to confirm the login still works."
+    wait "$DIALOG_PID" 2>/dev/null
+    dialog_close
     exit 0
 fi
 while IFS= read -r line; do
     log_message "WARN" "Still different: $line"
 done <<<"$remaining"
 log_message "WARN" "Finished with differences from a fresh local account"
+dialog_warn "Differences remain" "Verify Against Fresh Account"
+dialog_finish "Completed With Warnings" "Some differences remain. See the log: $LOG_FILE"
+wait "$DIALOG_PID" 2>/dev/null
+dialog_close
 exit 2
