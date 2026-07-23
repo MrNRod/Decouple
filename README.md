@@ -109,3 +109,8 @@ Test on a disposable Mac first. Version history is in git.
 - `MigrateUserHomeToDomainAcct.sh` by [Patrick Gallagher](https://twitter.com/patgmac), with guidance from [Lisa Davies](http://lisacherie.com/?p=239)
 - `MigrateADMobileAccounttoLocalAccount.command` by [Rich Trouton](https://github.com/rtrouton/rtrouton_scripts/tree/main/rtrouton_scripts/migrate_ad_mobile_account_to_local_account), with contributions from Rick Lemmon (AD unbind process) and an anonymous reporter (macOS 10.14.4 ShadowHashData fix)
 - `decouple.sh` by Noel Rodriguez-Lebron
+
+
+## Related project
+
+A macOS app version of this tool is available: [decouple-app](https://gitlab.com/MrNRod/decouple-app). It has a native SwiftUI interface and the same fresh-account behavior.
