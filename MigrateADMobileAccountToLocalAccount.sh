@@ -126,6 +126,14 @@ is_bound() {
     dsconfigad -show 2>/dev/null | grep -q "Active Directory Domain"
 }
 
+# The search paths live in the /Search node, so the node comes first (dscl /Search -read .).
+# `dscl . -read /Search` looks in the local node instead and prints nothing.
+search_paths() {
+    local plist
+    plist=$(dscl -plist /Search -read . CSPSearchPath 2>/dev/null) || return 1
+    attr_values_from_plist "$plist"
+}
+
 in_group() { # $1 = group, $2 = user
     dscl . -read "/Groups/$1" GroupMembership 2>/dev/null | tr ' ' '\n' | grep -qx "$2"
 }
@@ -134,6 +142,9 @@ in_group() { # $1 = group, $2 = user
 find_differences() {
     local entry key gid mode
     is_bound && echo "This Mac is still bound to Active Directory"
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] && is_ad_search_path "$entry" && echo "Active Directory is still in the search path"
+    done < <(search_paths)
     while IFS= read -r entry; do
         [[ -n "$entry" ]] && is_ad_authority_entry "$entry" && echo "AuthenticationAuthority has an AD entry"
     done < <(record_values "/Users/$username" AuthenticationAuthority)
@@ -248,7 +259,7 @@ ResetSearchPaths() {
         dscl /Search/Contacts -delete . CSPSearchPath "$path" &>/dev/null
         dscl /Search -delete . CSPSearchPath "$path" &>/dev/null
         notes="AD path removed. "
-    done < <(record_values /Search CSPSearchPath)
+    done < <(search_paths)
     for node in /Search /Search/Contacts; do
         dscl "$node" -read . SearchPolicy 2>/dev/null | grep -q "$automatic" && continue
         if dscl "$node" -change . SearchPolicy dsAttrTypeStandard:CSPSearchPath "$automatic" &>/dev/null; then
@@ -448,10 +459,8 @@ done < <(record_values "/Users/$username" AuthenticationAuthority)
 CaptureFileVaultState
 BackupAccountRecord
 
-if [[ $was_bound -eq 1 ]]; then
-    UnbindFromAD
-    ResetSearchPaths
-fi
+[[ $was_bound -eq 1 ]] && UnbindFromAD
+[[ $was_bound -eq 1 || "$differences" == *"in the search path"* ]] && ResetSearchPaths
 if [[ $was_mobile -eq 1 ]]; then
     RemoveMatchingValues AuthenticationAuthority is_ad_authority_entry
     CheckFileVaultIntact

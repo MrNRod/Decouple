@@ -9,7 +9,7 @@ helpers=$(sed -n '/^# BEGIN helpers/,/^# END helpers/p;/^# BEGIN readonly checks
 [[ -n "$helpers" ]] || { echo "Could not find the helpers block in $SCRIPT"; exit 2; }
 eval "$helpers"
 # A missing function must fail loudly instead of reading as "not flagged".
-for fn in attr_values_from_plist plist_keys record_values extra_policy_keys home_acl_is_stock is_enabled is_ad_search_path find_differences is_bound in_group is_ad_authority_entry is_ad_alt_identity is_domain_alias is_ad_attribute_key; do
+for fn in attr_values_from_plist plist_keys record_values search_paths extra_policy_keys home_acl_is_stock is_enabled is_ad_search_path find_differences is_bound in_group is_ad_authority_entry is_ad_alt_identity is_domain_alias is_ad_attribute_key; do
     declare -F "$fn" >/dev/null || { echo "helper not loaded: $fn"; exit 2; }
 done
 
@@ -110,6 +110,7 @@ dscl() {
         "-plist . -read /Users/jdoe") printf '%s' '<plist version="1.0"><dict><key>dsAttrTypeStandard:RecordName</key><array><string>jdoe</string></array><key>dsAttrTypeStandard:CachedGroups</key><array><string>g</string></array><key>dsAttrTypeStandard:AuthenticationAuthority</key><array><string>x</string></array></dict></plist>' ;;
         ". -read /Users/jdoe PrimaryGroupID") echo "PrimaryGroupID: 12" ;;
         ". -read /Groups/staff GroupMembership") echo "GroupMembership: root jdoe" ;;
+        "-plist /Search -read . CSPSearchPath") plist_doc dsAttrTypeStandard:CSPSearchPath /Local/Default "/Active Directory/All Domains" ;;
         "-plist . -read /Groups/admin NestedGroups") plist_doc dsAttrTypeStandard:NestedGroups "AAAA-BBBB" ;;
         *) return 1 ;;
     esac
@@ -117,6 +118,7 @@ dscl() {
 dsconfigad() { echo "Active Directory Domain = corp.example.com"; }
 username=jdoe; homedir=/nonexistent/jdoe
 expected="This Mac is still bound to Active Directory
+Active Directory is still in the search path
 AuthenticationAuthority has an AD entry
 AuthenticationAuthority has an AD entry
 AD attribute remains: dsAttrTypeStandard:CachedGroups
@@ -141,8 +143,16 @@ if [[ "${1:-}" != "--no-live" ]] && u=$(stat -f%Su /dev/console) && dscl . -read
     username=$u
     homedir=$(dscl . -read "/Users/$u" NFSHomeDirectory | sed 's/^NFSHomeDirectory: //')
     check "live account: find_differences is empty" "" "$(find_differences)"
+    # Positive controls: the same call form must return real data for a key that exists.
+    check "live: record_values reads real group data" yes "$(record_values /Groups/admin GroupMembership | grep -qx root && echo yes)"
+    check "live: in_group finds root in staff" yes "$(truthy in_group staff root)"
+    check "live: in_group rejects a non-member" no "$(truthy in_group staff "$u")"
     check "live account: admin NestedGroups absent (dscl exits 0 for a missing key)" "" "$(record_values /Groups/admin NestedGroups)"
-    check "live account: no AD search path" "" "$(record_values /Search CSPSearchPath | while IFS= read -r p; do is_ad_search_path "$p" && echo "$p"; done)"
+    # Must return real data: the local node is always in the search path, so an empty result means
+    # the dscl call is wrong (not that the search path is clean).
+    check "live: search_paths reads real data" "/Local/Default" "$(search_paths | head -1)"
+    check "live account: no AD search path" "" "$(search_paths | while IFS= read -r p; do is_ad_search_path "$p" && echo "$p"; done)"
+    check "old dscl form prints nothing (why search_paths exists)" "" "$(record_values /Search CSPSearchPath)"
     check "live account: home ACL is stock" yes "$(truthy home_acl_is_stock "$(ls -lde "$homedir")")"
     check "live account: no extra policy keys" "" "$(extra_policy_keys "$u")"
     check "live account: has entries to inspect" yes "$(truthy test "$(record_values "/Users/$u" AuthenticationAuthority | grep -c .)" -ge 2)"
