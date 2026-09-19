@@ -1,147 +1,15 @@
 #!/bin/bash
 # Converts an Active Directory mobile account into a local account that matches a fresh local account.
-# The account to convert is passed in the EnrollmentUser variable. See the README for usage and credits.
-# Modified 9/19/2026
+# EnrollmentUser = the account to convert. GrantAdmin=true (optional, default off) adds it to the admin group.
+# Exit codes: 0 done (or nothing to do), 1 stopped, 2 finished but differences from a fresh account remain.
+# See the README for usage and credits.
 Version=1.8
 
-# Logging configuration
 LOG_FILE="/var/log/mobile_to_local_migration.log"
-LOG_LEVEL="INFO" # DEBUG, INFO, WARN, ERROR
 
-# Logging function
+# Levels: INFO = what happened, WARN = a problem the run continues past, ERROR = the run stopped.
 log_message() {
-    local level="$1"
-    local message="$2"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    
-    # Define log levels
-    case "$level" in
-        "DEBUG") level_num=0 ;;
-        "INFO") level_num=1 ;;
-        "WARN") level_num=2 ;;
-        "ERROR") level_num=3 ;;
-        *) level_num=1 ;;
-    esac
-    
-    # Check if we should log this level
-    case "$LOG_LEVEL" in
-        "DEBUG") min_level=0 ;;
-        "INFO") min_level=1 ;;
-        "WARN") min_level=2 ;;
-        "ERROR") min_level=3 ;;
-        *) min_level=1 ;;
-    esac
-    
-    if [ $level_num -ge $min_level ]; then
-        echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
-    fi
-}
-
-# Initialize logging
-log_message "INFO" "=== Starting Mobile to Local Account Migration Script ==="
-log_message "INFO" "Script Version: $Version"
-log_message "INFO" "Log file: $LOG_FILE"
-log_message "INFO" "Log level: $LOG_LEVEL"
-
-MIGRATION_MARKER="/var/db/.mobile_to_local_migration_done"
-
-if [ -f "$MIGRATION_MARKER" ]; then
-    log_message "INFO" "Migration already completed. Marker file found: $MIGRATION_MARKER"
-    log_message "INFO" "Exiting script."
-    exit 0
-fi
-
-migration_error=0
-
-clear
-username=$EnrollmentUser
-if [[ ! "$username" =~ ^[A-Za-z0-9._-]{1,64}$ || "$username" == -* ]]; then
-    log_message "ERROR" "Invalid target user name: '$username'. Exiting."
-    echo "Invalid target user name. Exiting."
-    exit 1
-fi
-FullScriptName=$(basename "$0")
-ShowVersion="$FullScriptName $Version"
-
-log_message "INFO" "Target username: $username"
-log_message "INFO" "Script name: $FullScriptName"
-
-check4AD=$(dscl localhost -list . | grep "Active Directory")
-log_message "DEBUG" "AD binding check result: $check4AD"
-
-# Save current IFS state
-OLDIFS=$IFS
-
-IFS='.' read osvers_major osvers_minor osvers_dot_version <<< "$(sw_vers -productVersion)"
-
-# restore IFS to previous state
-IFS=$OLDIFS
-
-log_message "INFO" "macOS Version: $osvers_major.$osvers_minor.$osvers_dot_version"
-
-echo "********* Running $FullScriptName Version $Version *********"
-
-RunAsRoot()
-{
-        ##  Pass in the full path to the executable as $1
-        if [[ "${USER}" != "root" ]] ; then
-                log_message "WARN" "Script must be run as root. Current user: ${USER}"
-                echo
-                echo "***  This application must be run as root.  Please authenticate below.  ***"
-                echo
-                sudo "${1}" && exit 0
-        fi
-        log_message "INFO" "Script is running as root (user: ${USER})"
-}
-
-RemoveAD(){
-    log_message "INFO" "Starting AD removal process..."
-    
-    # This function force-unbinds the Mac from the existing Active Directory domain
-    # and updates the search path settings to remove references to Active Directory 
-
-    searchPath=$(dscl /Search -read . CSPSearchPath | grep Active\ Directory | sed 's/^ //')
-    log_message "DEBUG" "Found AD search path: $searchPath"
-
-    # Force unbind from Active Directory
-    log_message "INFO" "Force unbinding from Active Directory..."
-    if dsconfigad -remove -force -u none -p none; then
-        log_message "INFO" "Successfully unbound from Active Directory"
-    else
-        log_message "ERROR" "Failed to unbind from Active Directory"
-        migration_error=1
-    fi
-    
-    # Deletes the Active Directory domain from the custom /Search
-    # and /Search/Contacts paths
-    log_message "INFO" "Removing AD from search paths..."
-    if dscl /Search/Contacts -delete . CSPSearchPath "$searchPath"; then
-        log_message "DEBUG" "Removed AD from /Search/Contacts"
-    else
-        log_message "WARN" "Failed to remove AD from /Search/Contacts (may not exist)"
-    fi
-    
-    if dscl /Search -delete . CSPSearchPath "$searchPath"; then
-        log_message "DEBUG" "Removed AD from /Search"
-    else
-        log_message "WARN" "Failed to remove AD from /Search (may not exist)"
-    fi
-    
-    # Changes the /Search and /Search/Contacts path type from Custom to Automatic
-    log_message "INFO" "Changing search policy to Automatic..."
-    if dscl /Search -change . SearchPolicy dsAttrTypeStandard:CSPSearchPath dsAttrTypeStandard:NSPSearchPath; then
-        log_message "DEBUG" "Changed /Search policy to Automatic"
-    else
-        log_message "WARN" "Failed to change /Search policy"
-    fi
-    
-    if dscl /Search/Contacts -change . SearchPolicy dsAttrTypeStandard:CSPSearchPath dsAttrTypeStandard:NSPSearchPath; then
-        log_message "DEBUG" "Changed /Search/Contacts policy to Automatic"
-    else
-        log_message "WARN" "Failed to change /Search/Contacts policy"
-    fi
-    
-    log_message "INFO" "AD removal process completed"
+    printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" | tee -a "$LOG_FILE"
 }
 
 # BEGIN helpers (pure text handling, unit tested in tests/test_filters.sh)
@@ -178,10 +46,11 @@ plist_keys() {
     done
 }
 
-# $1 = user, $2 = attribute
-attr_values() {
+# $1 = record path (/Users/name, /Groups/staff, /Search), $2 = attribute. dscl exits 0 for a missing
+# key, so an absent attribute simply prints nothing.
+record_values() {
     local plist
-    plist=$(dscl -plist . -read "/Users/$1" "$2" 2>/dev/null) || return 1
+    plist=$(dscl -plist . -read "$1" "$2" 2>/dev/null) || return 1
     attr_values_from_plist "$plist"
 }
 
@@ -203,6 +72,11 @@ is_ad_alt_identity() {
 # True for a "user@DOMAIN" alias in RecordName.
 is_domain_alias() {
     [[ "$1" == *@* && "$1" != *LKDC* ]]
+}
+
+# True for an Active Directory entry in a search path.
+is_ad_search_path() {
+    [[ "$1" == *"Active Directory"* ]]
 }
 
 # True if a record key (dsAttrTypeStandard:X / dsAttrTypeNative:x) is a leftover AD attribute.
@@ -229,40 +103,82 @@ extra_policy_keys() {
         esac
     done < <(plist_keys "$inner")
 }
-# END helpers
 
-# Deletes single values of a multi-valued attribute, keeping the others.
-# $1 = attribute, $2 = predicate function
-RemoveMatchingValues() {
-    local attribute="$1" predicate="$2" value removed=0
-    while IFS= read -r value; do
-        [[ -n "$value" ]] || continue
-        "$predicate" "$value" || continue
-        log_message "INFO" "Removing $attribute value: ${value:0:60}"
-        if dscl . -delete "/Users/$username" "$attribute" "$value"; then
-            removed=$((removed + 1))
-        else
-            log_message "ERROR" "Failed to remove a $attribute value"
-            migration_error=1
-        fi
-    done < <(attr_values "$username" "$attribute")
-    log_message "INFO" "$attribute: removed $removed value(s)"
+# True if the text from `ls -led <home>` holds exactly the stock ACL entry and nothing else.
+# ACL entries print as " 0: group:everyone deny delete".
+home_acl_is_stock() {
+    local count
+    count=$(printf '%s\n' "$1" | grep -Ec '^ *[0-9]+: ')
+    [[ "$count" -eq 1 ]] && printf '%s\n' "$1" | grep -q 'group:everyone deny delete'
 }
 
-RemoveADAttributes() {
-    local plist key removed=0
-    plist=$(dscl -plist . -read "/Users/$username" 2>/dev/null)
+# True for GrantAdmin values that switch the option on.
+is_enabled() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        true | yes | 1) return 0 ;;
+    esac
+    return 1
+}
+# END helpers
+
+# BEGIN readonly checks (read the system but change nothing; run against a real account in tests/)
+is_bound() {
+    dsconfigad -show 2>/dev/null | grep -q "Active Directory Domain"
+}
+
+in_group() { # $1 = group, $2 = user
+    dscl . -read "/Groups/$1" GroupMembership 2>/dev/null | tr ' ' '\n' | grep -qx "$2"
+}
+
+# Prints one line for every way the account differs from a fresh local account.
+find_differences() {
+    local entry key gid mode
+    is_bound && echo "This Mac is still bound to Active Directory"
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] && is_ad_authority_entry "$entry" && echo "AuthenticationAuthority has an AD entry"
+    done < <(record_values "/Users/$username" AuthenticationAuthority)
     while IFS= read -r key; do
-        [[ -n "$key" ]] && is_ad_attribute_key "$key" || continue
-        if dscl . -delete "/Users/$username" "$key"; then
-            log_message "DEBUG" "Removed $key"
-            removed=$((removed + 1))
-        else
-            log_message "ERROR" "Failed to remove $key"
-            migration_error=1
-        fi
-    done < <(plist_keys "$plist")
-    log_message "INFO" "Removed $removed AD attribute(s)"
+        [[ -n "$key" ]] && is_ad_attribute_key "$key" && echo "AD attribute remains: $key"
+    done < <(plist_keys "$(dscl -plist . -read "/Users/$username" 2>/dev/null)")
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] && is_ad_alt_identity "$entry" && echo "AltSecurityIdentities has an AD Kerberos principal"
+    done < <(record_values "/Users/$username" AltSecurityIdentities)
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] && is_domain_alias "$entry" && echo "RecordName has a domain alias: $entry"
+    done < <(record_values "/Users/$username" RecordName)
+    gid=$(dscl . -read "/Users/$username" PrimaryGroupID 2>/dev/null | awk '{print $2}')
+    [[ "$gid" == "20" ]] || echo "PrimaryGroupID is $gid, a fresh account uses 20"
+    [[ -n "$(extra_policy_keys "$username")" ]] && echo "Account policy still has AD rules"
+    [[ -n "$(record_values /Groups/admin NestedGroups)" ]] && echo "The admin group has nested (AD) groups"
+    in_group staff "$username" && echo "The user is listed in the staff group; on a fresh account only root is"
+    if [[ -d "$homedir" ]]; then
+        mode=$(stat -f %Lp "$homedir")
+        [[ "$mode" == "755" ]] || echo "Home folder mode is $mode, a fresh account uses 755"
+        [[ "$(stat -f %g "$homedir")" == "20" ]] || echo "Home folder group is not staff"
+        home_acl_is_stock "$(ls -lde "$homedir")" || echo "Home folder ACL isn't just 'everyone deny delete'"
+    fi
+}
+
+# END readonly checks
+
+# Security software can interrupt file-system tools (EINTR / fts_read). Retry only those.
+# Output of the last attempt is left in FS_OUTPUT.
+FS_OUTPUT=""
+retry_fs() {
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        FS_OUTPUT=$("$@" 2>&1) && return 0
+        case "$FS_OUTPUT" in
+            *"Interrupted system call"* | *fts_read*) sleep 2 ;;
+            *) return 1 ;;
+        esac
+    done
+    return 1
+}
+
+# SIP/TCC blocks some paths even for root. That isn't a failure of the migration.
+fs_ok() {
+    [[ "$FS_OUTPUT" == *"Operation not permitted"* ]]
 }
 
 # FileVault / SecureToken guard. Captured before any change to the account.
@@ -274,22 +190,21 @@ crypto_users() {
 }
 
 CaptureFileVaultState() {
-    attr_values "$username" AuthenticationAuthority | grep -q "SecureToken" && HAD_SECURETOKEN=1
+    record_values "/Users/$username" AuthenticationAuthority | grep -q "SecureToken" && HAD_SECURETOKEN=1
     if fdesetup status 2>/dev/null | grep -q "FileVault is On"; then
         FILEVAULT_ON=1
         CRYPTO_BEFORE=$(crypto_users)
     fi
-    log_message "INFO" "FileVault on: $FILEVAULT_ON, SecureToken present: $HAD_SECURETOKEN"
 }
 
-# Exits if the user could no longer unlock FileVault.
+# Stops the run if the user could no longer unlock FileVault.
 CheckFileVaultIntact() {
-    if [[ $HAD_SECURETOKEN -eq 1 ]] && ! attr_values "$username" AuthenticationAuthority | grep -q "SecureToken"; then
-        log_message "ERROR" "SecureToken entry is gone. Stopping: $username may not be able to unlock FileVault."
+    if [[ $HAD_SECURETOKEN -eq 1 ]] && ! record_values "/Users/$username" AuthenticationAuthority | grep -q "SecureToken"; then
+        log_message "ERROR" "The SecureToken entry is gone. Stopping: $username may not be able to unlock FileVault."
         exit 1
     fi
     if [[ $FILEVAULT_ON -eq 1 && "$(crypto_users)" != "$CRYPTO_BEFORE" ]]; then
-        log_message "ERROR" "FileVault crypto users changed. Stopping."
+        log_message "ERROR" "The FileVault crypto users changed. Stopping."
         exit 1
     fi
 }
@@ -300,301 +215,268 @@ BackupAccountRecord() {
     file="/var/log/mobile_to_local_backup_${username}_$(date +%s).plist"
     if ( umask 077; dscl -plist . -read "/Users/$username" > "$file" ); then
         plutil -remove 'dsAttrTypeNative:ShadowHashData' "$file" 2>/dev/null
+        plutil -insert '_dsconfigad_show' -string "$(dsconfigad -show 2>&1)" "$file" 2>/dev/null
         chmod 600 "$file"
-        log_message "INFO" "Account record backed up to $file"
+        log_message "INFO" "Backed up the account record to $file"
     else
-        log_message "ERROR" "Could not back up the account record. Exiting."
+        log_message "ERROR" "Could not back up the account record. Stopping."
         exit 1
     fi
 }
 
-PasswordMigration(){
-    log_message "INFO" "Starting authentication authority cleanup..."
-
-    # macOS 10.14.4 removes the actual ShadowHashData key immediately if the AuthenticationAuthority
-    # value that references the ShadowHash is removed. Only AD entries are removed here; the
-    # ShadowHash, SecureToken and local Kerberos (@LKDC) entries stay, so the local password and the
-    # FileVault login keep working.
-    RemoveMatchingValues AuthenticationAuthority is_ad_authority_entry
-    CheckFileVaultIntact
-    log_message "INFO" "Authentication authority cleanup completed"
+UnbindFromAD() {
+    local attempt output
+    for attempt in 1 2 3; do
+        output=$(dsconfigad -remove -force -u none -p none 2>&1)
+        # Restart Directory Services and let AD release before checking; checking sooner races.
+        killall opendirectoryd &>/dev/null
+        sleep 2
+        if ! is_bound; then
+            log_message "INFO" "Unbound from Active Directory"
+            return 0
+        fi
+    done
+    log_message "WARN" "Still bound to Active Directory after 3 attempts: $output"
 }
 
-RunAsRoot "${0}"
+# Removes AD from the custom search paths and puts the search policy back to Automatic,
+# which is what a Mac that was never bound has.
+ResetSearchPaths() {
+    local automatic="dsAttrTypeStandard:NSPSearchPath" path node notes=""
+    while IFS= read -r path; do
+        [[ -n "$path" ]] && is_ad_search_path "$path" || continue
+        dscl /Search/Contacts -delete . CSPSearchPath "$path" &>/dev/null
+        dscl /Search -delete . CSPSearchPath "$path" &>/dev/null
+        notes="AD path removed. "
+    done < <(record_values /Search CSPSearchPath)
+    for node in /Search /Search/Contacts; do
+        dscl "$node" -read . SearchPolicy 2>/dev/null | grep -q "$automatic" && continue
+        if dscl "$node" -change . SearchPolicy dsAttrTypeStandard:CSPSearchPath "$automatic" &>/dev/null; then
+            notes="${notes}$node set to Automatic. "
+        else
+            log_message "WARN" "Could not set $node to Automatic"
+        fi
+    done
+    [[ -n "$notes" ]] && log_message "INFO" "Search paths: $notes"
+}
 
-if ! id "$username" &>/dev/null; then
-    log_message "ERROR" "User $username does not exist. Exiting."
-    echo "User $username does not exist. Exiting."
+# Deletes single values of a multi-valued attribute, keeping the others.
+# $1 = attribute, $2 = predicate function
+RemoveMatchingValues() {
+    local attribute="$1" predicate="$2" value removed=0
+    while IFS= read -r value; do
+        [[ -n "$value" ]] || continue
+        "$predicate" "$value" || continue
+        if dscl . -delete "/Users/$username" "$attribute" "$value"; then
+            removed=$((removed + 1))
+        else
+            log_message "WARN" "Could not remove a value from $attribute"
+        fi
+    done < <(record_values "/Users/$username" "$attribute")
+    [[ $removed -gt 0 ]] && log_message "INFO" "Removed $removed AD value(s) from $attribute"
+}
+
+RemoveADAttributes() {
+    local key removed=0 names=""
+    while IFS= read -r key; do
+        [[ -n "$key" ]] && is_ad_attribute_key "$key" || continue
+        if dscl . -delete "/Users/$username" "$key"; then
+            removed=$((removed + 1))
+            names="$names ${key#dsAttrType*:}"
+        else
+            log_message "WARN" "Could not remove $key"
+        fi
+    done < <(plist_keys "$(dscl -plist . -read "/Users/$username" 2>/dev/null)")
+    [[ $removed -gt 0 ]] && log_message "INFO" "Removed $removed AD attribute(s):$names"
+}
+
+# Clear AD-imposed password rules (expiry etc.). Only when there are any, so a fresh
+# account's own policy data (creation time etc.) is left alone.
+ClearAccountPolicies() {
+    [[ -n "$(extra_policy_keys "$username")" ]] || return 0
+    if pwpolicy -n /Local/Default -u "$username" -clearaccountpolicies &>/dev/null; then
+        log_message "INFO" "Cleared AD account policies"
+    else
+        log_message "WARN" "Could not clear AD account policies"
+    fi
+}
+
+# As root plain kdestroy only clears root's tickets, so run it in the user's session.
+DestroyKerberosTickets() {
+    launchctl asuser "$uid" /usr/bin/kdestroy -a &>/dev/null && log_message "INFO" "Destroyed Kerberos tickets"
+}
+
+# A fresh account is in staff through PrimaryGroupID 20, not through the group's member list.
+RemoveStaffListing() {
+    in_group staff "$username" || return 0
+    if dseditgroup -o edit -d "$username" -t user staff; then
+        log_message "INFO" "Removed the explicit staff group listing"
+    else
+        log_message "WARN" "Could not remove the staff group listing"
+    fi
+}
+
+# Opt-in. A fresh local account isn't an admin unless asked to be.
+GrantAdminRights() {
+    is_enabled "$GrantAdmin" || return 0
+    in_group admin "$username" && return 0
+    if dseditgroup -o edit -a "$username" -t user admin; then
+        log_message "INFO" "Added $username to the admin group"
+    else
+        log_message "WARN" "Could not add $username to the admin group"
+    fi
+}
+
+ResetPrimaryGroup() {
+    [[ "$original_gid" == "20" ]] && return 0
+    if dscl . -create "/Users/$username" PrimaryGroupID 20; then
+        log_message "INFO" "Reset PrimaryGroupID from $original_gid to 20 (staff)"
+    else
+        log_message "WARN" "Could not reset PrimaryGroupID"
+    fi
+}
+
+# Owner, group and permissions of the home folder, set to a stock macOS layout.
+FixHomeFolder() {
+    local mode
+    if [[ ! -d "$homedir" ]]; then
+        log_message "WARN" "Home folder not found: $homedir"
+        return 0
+    fi
+
+    # Ownership of the folder itself.
+    if [[ "$(stat -f %u:%g "$homedir")" != "$uid:20" ]]; then
+        if retry_fs chown "$uid:20" "$homedir" || fs_ok; then
+            log_message "INFO" "Set the home folder owner and group (staff)"
+        else
+            log_message "WARN" "Could not set home folder ownership: ${FS_OUTPUT:0:200}"
+        fi
+    fi
+
+    # Files created while the account was an AD user carry the AD primary group. Only those are
+    # changed; the UID is unchanged so user ownership is already correct.
+    if [[ -n "$original_gid" && "$original_gid" != "20" ]]; then
+        if [[ "$(basename "$homedir")" == "$username" ]]; then
+            if retry_fs find "$homedir" -xdev -gid "$original_gid" -exec chgrp -h 20 {} +; then
+                log_message "INFO" "Changed files in the home folder from group $original_gid to staff"
+            elif fs_ok; then
+                log_message "INFO" "Changed the group on home folder files (skipped protected files)"
+            else
+                log_message "WARN" "Could not change the group on all home folder files: ${FS_OUTPUT:0:200}"
+            fi
+        else
+            log_message "WARN" "Skipped the group change: '$homedir' is not a folder named for $username"
+        fi
+    fi
+
+    mode=$(stat -f %Lp "$homedir")
+    if [[ "$mode" != "755" ]]; then
+        if retry_fs chmod 755 "$homedir" || fs_ok; then
+            log_message "INFO" "Set the home folder mode to 755 (was $mode)"
+        else
+            log_message "WARN" "Could not set the home folder mode: ${FS_OUTPUT:0:200}"
+        fi
+    fi
+
+    # Remove every ACL first (stale domain entries), then add the stock one.
+    if ! home_acl_is_stock "$(ls -lde "$homedir")"; then
+        if retry_fs chmod -N "$homedir" && retry_fs chmod +a "group:everyone deny delete" "$homedir"; then
+            log_message "INFO" "Reset the home folder ACL to the stock entry"
+        else
+            log_message "WARN" "Could not reset the home folder ACL: ${FS_OUTPUT:0:200}"
+        fi
+    fi
+
+    if [[ -d "$homedir/Public" && "$(stat -f %Lp "$homedir/Public")" != "755" ]]; then
+        retry_fs chmod 755 "$homedir/Public" || fs_ok || log_message "WARN" "Could not set the Public folder mode"
+    fi
+}
+
+RestartDirectoryServices() {
+    local waited=0
+    killall opendirectoryd &>/dev/null
+    # Wait for the account to be readable again instead of sleeping a fixed time.
+    while [[ $waited -lt 30 ]] && ! dscl . -read "/Users/$username" UniqueID &>/dev/null; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    log_message "INFO" "Restarted Directory Services"
+}
+
+# --- Main ---------------------------------------------------------------------------------------
+
+if [[ $EUID -ne 0 ]]; then
+    echo "This script must be run as root."
+    exit 1
+fi
+[[ -e "$LOG_FILE" ]] || ( umask 077; : > "$LOG_FILE" )
+
+username=$EnrollmentUser
+GrantAdmin=${GrantAdmin:-false}
+
+if [[ ! "$username" =~ ^[A-Za-z0-9._-]{1,64}$ || "$username" == -* ]]; then
+    log_message "ERROR" "Invalid target user name: '$username'"
+    exit 1
+fi
+if ! dscl . -read "/Users/$username" &>/dev/null; then
+    log_message "ERROR" "User $username does not exist"
     exit 1
 fi
 
-log_message "INFO" "User $username exists, checking account type..."
+log_message "INFO" "MigrateADMobileAccountToLocalAccount $Version: $username, macOS $(sw_vers -productVersion)"
 
-accounttype=$(dscl . -read /Users/"$username" AuthenticationAuthority | head -2 | awk -F'/' '{print $2}' | tr -d '\n')
-log_message "DEBUG" "Account type: $accounttype"
+uid=$(id -u "$username")
+homedir=$(dscl . -read "/Users/$username" NFSHomeDirectory | sed 's/^NFSHomeDirectory: //')
+original_gid=$(dscl . -read "/Users/$username" PrimaryGroupID | awk '{print $2}')
 
-# Exit if the account is already a local account and AD is not bound
-if [[ "$accounttype" != "Active Directory" && -z "$check4AD" ]]; then
-    log_message "INFO" "User $username is already a local account and AD is not bound. Skipping migration."
-    if touch "$MIGRATION_MARKER"; then
-        log_message "INFO" "Created migration marker for local account: $MIGRATION_MARKER"
-        echo "Migration skipped: $username is already a local account and AD is unbound. Marker file created."
-    else
-        log_message "ERROR" "Failed to create migration marker for local account"
-        migration_error=1
-        exit 1
-    fi
+differences=$(find_differences)
+if [[ -z "$differences" ]]; then
+    log_message "INFO" "No Active Directory traces found. Nothing to do."
     exit 0
 fi
+while IFS= read -r line; do
+    log_message "INFO" "Found: $line"
+done <<<"$differences"
 
-# Check for AD binding and offer to unbind if found. 
-if [[ "${check4AD}" = "Active Directory" ]]; then
-    log_message "INFO" "Active Directory binding detected. Removing AD binding..."
-    RemoveAD
-    echo "AD binding has been removed."
-else
-    log_message "INFO" "No Active Directory binding detected"
-fi
-
-# Check if the account is a AD mobile account
-if [[ "$accounttype" = "Active Directory" ]]; then
-    mobileusercheck=$(dscl . -read /Users/"$username" AuthenticationAuthority | head -2 | awk -F'/' '{print $1}' | tr -d '\n' | sed 's/^[^:]*: //' | sed s/\;/""/g)
-    log_message "DEBUG" "Mobile user check: $mobileusercheck"
-    
-    if [[ "$mobileusercheck" = "LocalCachedUser" ]]; then
-        log_message "INFO" "$username has an AD mobile account. Starting conversion process..."
-        printf "$username has an AD mobile account.\nConverting to a local account with the same username and UID.\n"
-    else
-        log_message "INFO" "The $username account is not a AD mobile account"
-        printf "The $username account is not a AD mobile account\n"
-        exit 0
-    fi
-else
-    log_message "INFO" "The $username account is not a AD mobile account"
-    printf "The $username account is not a AD mobile account\n"
-    exit 0
-fi
-
-log_message "INFO" "Starting account attribute removal process..."
+# What decides which steps run, captured before anything changes.
+is_bound && was_bound=1 || was_bound=0
+was_mobile=0
+while IFS= read -r entry; do
+    is_ad_authority_entry "$entry" && was_mobile=1
+done < <(record_values "/Users/$username" AuthenticationAuthority)
 
 CaptureFileVaultState
 BackupAccountRecord
-original_gid=$(dscl . -read /Users/"$username" PrimaryGroupID 2>/dev/null | awk '{print $2}')
-log_message "INFO" "Original PrimaryGroupID: $original_gid"
 
-# Remove the account attributes that identify it as an Active Directory mobile account.
-# Only attributes that are present are touched, so a missing one is not an error.
+if [[ $was_bound -eq 1 ]]; then
+    UnbindFromAD
+    ResetSearchPaths
+fi
+if [[ $was_mobile -eq 1 ]]; then
+    RemoveMatchingValues AuthenticationAuthority is_ad_authority_entry
+    CheckFileVaultIntact
+fi
 RemoveADAttributes
-
-# AD Kerberos principals and "user@DOMAIN" aliases only; the Apple Account value and the primary name stay.
 RemoveMatchingValues AltSecurityIdentities is_ad_alt_identity
 RemoveMatchingValues RecordName is_domain_alias
+ClearAccountPolicies
+[[ $was_mobile -eq 1 ]] && DestroyKerberosTickets
+RemoveStaffListing
+GrantAdminRights
+ResetPrimaryGroup
 
-# Clear AD-imposed password rules (expiry etc.); a fresh account has none. Only when there are any,
-# so a fresh account's own policy data (creation time etc.) is left alone.
-if [[ -n "$(extra_policy_keys "$username")" ]]; then
-    log_message "INFO" "Clearing AD account policies..."
-    pwpolicy -n /Local/Default -u "$username" -clearaccountpolicies || log_message "WARN" "pwpolicy -clearaccountpolicies failed"
-else
-    log_message "INFO" "No AD account policies to clear"
-fi
+# Record changes are done. The rest touches the file system.
+FixHomeFolder
+RestartDirectoryServices
 
-# Destroy the user's Kerberos tickets. As root plain kdestroy only clears root's, so run it in the user's session.
-launchctl asuser "$(id -u "$username")" /usr/bin/kdestroy -a 2>/dev/null || log_message "DEBUG" "No Kerberos tickets to destroy"
-
-log_message "INFO" "Account attribute removal completed"
-
-# Remove AD entries from AuthenticationAuthority
-PasswordMigration
-
-# A fresh account is in staff through PrimaryGroupID 20. Record changes finish here,
-# before the file system is touched.
-log_message "INFO" "Resetting PrimaryGroupID to 20 (staff)..."
-if ! dscl . -create "/Users/$username" PrimaryGroupID 20; then
-    log_message "ERROR" "Failed to reset PrimaryGroupID"
-    migration_error=1
-fi
-
-# Refresh Directory Services
-log_message "INFO" "Refreshing Directory Services..."
-if [[ ( ${osvers_major} -eq 10 && ${osvers_minor} -lt 7 ) ]]; then
-    log_message "DEBUG" "Killing DirectoryService process..."
-    if killall DirectoryService; then
-        log_message "INFO" "Successfully killed DirectoryService"
-    else
-        log_message "ERROR" "Failed to kill DirectoryService"
-        migration_error=1
-    fi
-else
-    log_message "DEBUG" "Killing opendirectoryd process..."
-    if killall opendirectoryd; then
-        log_message "INFO" "Successfully killed opendirectoryd"
-    else
-        log_message "ERROR" "Failed to kill opendirectoryd"
-        migration_error=1
-    fi
-fi
-
-log_message "INFO" "Waiting 20 seconds for directory services to restart..."
-sleep 20
-
-log_message "INFO" "Verifying conversion process..."
-accounttype=$(dscl . -read /Users/"$username" AuthenticationAuthority | head -2 | awk -F'/' '{print $2}' | tr -d '\n')
-log_message "DEBUG" "Post-conversion account type: $accounttype"
-
-if [[ "$accounttype" = "Active Directory" ]]; then
-    log_message "ERROR" "Conversion process failed. Account is still an AD mobile account."
-    printf "Something went wrong with the conversion process.\nThe $username account is still an AD mobile account.\n"
-    exit 1
-else
-    log_message "INFO" "Conversion process successful. Account is now a local account."
-    printf "Conversion process was successful.\nThe $username account is now a local account.\n"
-fi
-
-log_message "INFO" "Updating home directory permissions..."
-homedir=$(dscl . -read /Users/"$username" NFSHomeDirectory | sed 's/^NFSHomeDirectory: //')
-if [[ -d "$homedir" ]]; then
-    log_message "INFO" "Home directory location: $homedir"
-
-    # Remove stale domain-based ACLs
-    log_message "INFO" "Updating home folder permissions for the $username account"
-    if chmod -N "$homedir"; then
-        log_message "INFO" "Successfully removed existing ACLs"
-    else
-        log_message "WARN" "Failed to remove ACLs"
-        migration_error=1
-    fi
-
-    # Set the home directory ownership to the user and the group to staff (20).
-    # Only recurse into a folder that is clearly this user's.
-    if [[ "$(basename "$homedir")" == "$username" && "$homedir" != "/" ]]; then
-        log_message "INFO" "Resetting ownership of $homedir (some paths may be protected by SIP)"
-        chown_errors=$(mktemp -t chown_errors)
-        if chown -R "$username:staff" "$homedir" 2>"$chown_errors"; then
-            log_message "INFO" "chown completed"
-        elif grep -q "Operation not permitted" "$chown_errors"; then
-            log_message "WARN" "chown reported 'Operation not permitted' on protected files - safe to ignore"
-        else
-            log_message "ERROR" "chown failed with unexpected errors"
-            cat "$chown_errors" >> "$LOG_FILE"
-            migration_error=1
-        fi
-        rm -f "$chown_errors"
-    else
-        log_message "WARN" "Skipping recursive chown: '$homedir' is not a folder named for $username"
-        migration_error=1
-    fi
-
-    # Stock macOS home folder: drwxr-xr-x with an "everyone deny delete" ACL.
-    if chmod 755 "$homedir"; then
-        log_message "INFO" "Set home folder mode to 755"
-    else
-        log_message "ERROR" "Failed to set home folder mode"
-        migration_error=1
-    fi
-    log_message "INFO" "Setting no access for everyone group on $homedir"
-    if chmod +a "group:everyone deny delete" "$homedir"; then
-        log_message "INFO" "Successfully set everyone group permissions"
-    else
-        log_message "ERROR" "Failed to set everyone group permissions"
-        migration_error=1
-    fi
-else
-    log_message "WARN" "No home directory found for user $username"
-    migration_error=1
-fi
-
-# A fresh account is NOT listed in the staff group (only root is); it is a member through
-# PrimaryGroupID 20. Remove a listing left by an earlier version of this script.
-if dscl . -read /Groups/staff GroupMembership 2>/dev/null | tr ' ' '\n' | grep -qx "$username"; then
-    log_message "INFO" "Removing explicit staff group listing for $username..."
-    dseditgroup -o edit -d "$username" -t user staff || { log_message "ERROR" "Failed to remove staff listing"; migration_error=1; }
-fi
-
-log_message "INFO" "Displaying user and group information for the $username account"
-if id "$username"; then
-    log_message "INFO" "Successfully retrieved user information"
-else
-    log_message "ERROR" "Failed to retrieve user information"
-    migration_error=1
-fi
-
-# Automatically grant admin rights to the local account
-log_message "INFO" "Granting admin rights to $username..."
-if dseditgroup -o edit -a "$username" -t user admin; then
-    log_message "INFO" "Successfully granted admin rights to $username"
-    echo "Admin rights automatically granted to the $username account"
-else
-    log_message "ERROR" "Failed to grant admin rights to $username"
-    migration_error=1
-fi
-
-# Check if $EnrollmentUser is in awagent_enrolled group, and add if missing
-log_message "INFO" "Checking awagent_enrolled group membership..."
-if ! dseditgroup -o checkmember -m "$username" awagent_enrolled | grep -q "yes"; then
-    log_message "INFO" "$username is not in awagent_enrolled group. Adding..."
-    if dseditgroup -o edit -a "$username" -t user awagent_enrolled; then
-        log_message "INFO" "Successfully added $username to awagent_enrolled group"
-    else
-        log_message "ERROR" "Failed to add $username to awagent_enrolled group"
-        migration_error=1
-    fi
-else
-    log_message "INFO" "$username is already a member of awagent_enrolled group."
-fi
-
-# Remove macadmin from awagent_enrolled group if present
-log_message "INFO" "Checking if 'macadmin' is in awagent_enrolled group..."
-if dseditgroup -o checkmember -m "macadmin" awagent_enrolled | grep -q "yes"; then
-    log_message "INFO" "'macadmin' is a member of awagent_enrolled. Removing..."
-    if dseditgroup -o edit -d "macadmin" -t user awagent_enrolled; then
-        log_message "INFO" "Successfully removed 'macadmin' from awagent_enrolled group"
-    else
-        log_message "ERROR" "Failed to remove 'macadmin' from awagent_enrolled group"
-        migration_error=1
-    fi
-else
-    log_message "INFO" "'macadmin' is not a member of awagent_enrolled. No action needed."
-fi
-
-# Compare with a fresh local account and report any difference.
-VerifyFreshAccount() {
-    local diffs=0 gid mode entry key
-    while IFS= read -r entry; do
-        [[ -n "$entry" ]] && is_ad_authority_entry "$entry" && { log_message "WARN" "Fresh-account check: AD entry remains in AuthenticationAuthority"; diffs=$((diffs + 1)); }
-    done < <(attr_values "$username" AuthenticationAuthority)
-    while IFS= read -r key; do
-        [[ -n "$key" ]] && is_ad_attribute_key "$key" && { log_message "WARN" "Fresh-account check: AD attribute remains: $key"; diffs=$((diffs + 1)); }
-    done < <(plist_keys "$(dscl -plist . -read "/Users/$username" 2>/dev/null)")
-    gid=$(dscl . -read /Users/"$username" PrimaryGroupID | awk '{print $2}')
-    [[ "$gid" == "20" ]] || { log_message "WARN" "Fresh-account check: PrimaryGroupID is $gid, expected 20"; diffs=$((diffs + 1)); }
-    if [[ -d "$homedir" ]]; then
-        mode=$(stat -f %Lp "$homedir")
-        [[ "$mode" == "755" ]] || { log_message "WARN" "Fresh-account check: home mode is $mode, expected 755"; diffs=$((diffs + 1)); }
-        ls -lde "$homedir" | grep -q "group:everyone deny delete" || { log_message "WARN" "Fresh-account check: home ACL missing"; diffs=$((diffs + 1)); }
-    fi
-    if [[ $diffs -eq 0 ]]; then
-        log_message "INFO" "Fresh-account check: $username matches a fresh local account"
-    else
-        log_message "WARN" "Fresh-account check: $diffs difference(s) found"
-    fi
-}
-VerifyFreshAccount
+remaining=$(find_differences)
 CheckFileVaultIntact
-
-if [[ $migration_error -eq 0 ]]; then
-    log_message "INFO" "Migration completed successfully. Creating marker file..."
-    if touch "$MIGRATION_MARKER"; then
-        log_message "INFO" "Successfully created migration marker file: $MIGRATION_MARKER"
-        echo "Migration for $username completed successfully. Marker file created."
-    else
-        log_message "ERROR" "Failed to create migration marker file"
-        migration_error=1
-    fi
-else
-    log_message "ERROR" "Migration encountered errors. Marker file not created."
-    echo "Migration encountered errors. Marker file not created."
-    exit 1
+if [[ -z "$remaining" ]]; then
+    log_message "INFO" "Done: $username matches a fresh local account"
+    exit 0
 fi
-
-log_message "INFO" "=== Mobile to Local Account Migration Script Completed ==="
+while IFS= read -r line; do
+    log_message "WARN" "Still different: $line"
+done <<<"$remaining"
+log_message "WARN" "Finished with differences from a fresh local account"
+exit 2
