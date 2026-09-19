@@ -158,27 +158,11 @@ migration_error=0
 #
 # Version 1.8
 #
-# Goal: the converted account matches a fresh local account. Verified against a stock macOS account.
-#
 # Changes:
 #
-# 1. AuthenticationAuthority: every entry is inspected. Only Active Directory entries (LocalCachedUser,
-#    Kerberosv5 that is not @LKDC, NetLogon) are removed. ShadowHash, SecureToken and the local
-#    Kerberosv5 @LKDC entry are never removed. Version 1.7 removed the FIRST Kerberosv5 entry, which
-#    can be the local one and can leave the AD one behind.
-# 2. AltSecurityIdentities: only AD Kerberos values are removed, not the whole attribute (an Apple
-#    Account keeps an X509 value there).
-# 3. Attributes are removed only when present, so a missing attribute no longer counts as a migration
-#    error (which used to stop the marker file from being written).
-# 4. The account is no longer added to the staff group: a fresh account is a member through
-#    PrimaryGroupID 20 and staff lists only root. PrimaryGroupID is reset to 20, and an explicit staff
-#    listing from an earlier version is removed.
-# 5. Home folder is set to 755 with the "everyone deny delete" ACL, like a fresh account.
-# 6. FileVault guard: aborts if SecureToken or the FileVault crypto-user entry disappears.
-# 7. Account record is backed up (without the password hash) to /var/log before any change.
-# 8. Kerberos tickets are destroyed in the user's session; the user name is validated;
-#    a predictable /tmp file is replaced by mktemp; the home path is read without awk word splitting.
-# 9. A final check compares the account with a fresh local account and logs any difference.
+# 1. The converted account now matches a fresh local account. Only AD entries are removed from
+#    AuthenticationAuthority (ShadowHash, SecureToken and the local @LKDC Kerberos entry are kept).
+# 2. Added a FileVault guard and a backup of the account record before any change.
 
 clear
 username=$EnrollmentUser
