@@ -45,3 +45,18 @@ The script performs the following actions:
 ### Logging
 - Logs all actions to `/var/log/mobile_to_local_migration.log`.
 - Creates a marker file `/var/db/.mobile_to_local_migration_done` upon successful completion to prevent re-running.
+## Version 1.8: fresh-account result
+
+The converted account is made to match a fresh local account. See the Version 1.8 notes at the top of
+the script. Highlights: only AD entries are removed from `AuthenticationAuthority` (`ShadowHash`,
+`SecureToken` and the local `@LKDC` Kerberos entry are kept), the account isn't added to `staff`,
+the home folder is 755 with the "everyone deny delete" ACL, the account record is backed up first
+(no password hash), and a FileVault guard stops the run if unlock could break.
+
+Tests for the parsing and filtering helpers (read-only, run with the macOS bash):
+
+```
+/bin/bash tests/test_filters.sh
+```
+
+This has not been run against a real AD-bound Mac. Test on a disposable one first.
