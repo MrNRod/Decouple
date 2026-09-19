@@ -1,4 +1,6 @@
 #!/bin/bash
+# Converts an Active Directory mobile account into a local account that matches a fresh local account.
+# The account to convert is passed in the EnrollmentUser variable. See the README for usage and credits.
 # Modified 9/19/2026
 Version=1.8
 
@@ -50,119 +52,6 @@ if [ -f "$MIGRATION_MARKER" ]; then
 fi
 
 migration_error=0
-
-# Original source is from MigrateUserHomeToDomainAcct.sh
-# Written by Patrick Gallagher - https://twitter.com/patgmac
-#
-# Guidance and inspiration from Lisa Davies:
-# http://lisacherie.com/?p=239
-#
-# Modified by Rich Trouton
-# https://github.com/rtrouton/rtrouton_scripts/tree/main/rtrouton_scripts/migrate_ad_mobile_account_to_local_account
-#
-# Modified by Noel Rodriguez-Lebron
-#
-# Version 1.0 - Migrates an Active Directory mobile account to a local account by the following process:
-
-# 1. Detect if the Mac is bound to AD and offer to unbind the Mac from AD if desired
-# 2. Display a list of the accounts with a UID greater than 1000
-# 3. Remove the following attributes from the specified account:
-# 
-# cached_groups
-# cached_auth_policy
-# CopyTimestamp - This attribute is used by the OS to determine if the account is a mobile account
-# SMBPrimaryGroupSID
-# OriginalAuthenticationAuthority
-# OriginalNodeName
-# SMBSID
-# SMBScriptPath
-# SMBPasswordLastSet
-# SMBGroupRID
-# PrimaryNTDomain
-# AppleMetaRecordName
-# MCXSettings
-# MCXFlags
-#
-# 4. Selectively modify the account's AuthenticationAuthority attribute to remove AD-specific attributes.
-# 5. Restart the directory services process
-# 6. Check to see if the conversion process succeeded by checking the OriginalNodeName attribute for the value "Active Directory"
-# 7. If the conversion process succeeded, update the permissions on the account's home folder.
-# 8. Prompt if admin rights should be granted for the specified account
-#
-# Version 1.1
-#
-# Changes:
-# 
-# 1. After conversion, the specified account is added to the staff group.  All local accounts on this Mac are members of the staff group,
-#    but AD mobile accounts are not members of the staff group.
-# 2. The "accounttype" variable is now checking the AuthenticationAuthority attribute instead of the OriginalNodeName attribute. 
-#    The reason for Change 2's attributes change is that the AuthenticationAuthority attribute will exist following the conversion 
-#    process while the OriginalNodeName attribute may not.
-#
-#
-# Version 1.2
-#
-# Changes:
-#
-# Add RemoveAD function to handle the following tasks:
-#
-# 1. Force unbind the Mac from Active Directory
-# 2. Deletes the Active Directory domain from the custom /Search and /Search/Contacts paths
-# 3. Changes the /Search and /Search/Contacts path type from Custom to Automatic
-# 
-# Thanks to Rick Lemmon for the suggested changes to the AD unbind process.
-#
-# Version 1.3
-#
-# Changes:
-#
-# Fix to account password backup and restore process. Previous versions 
-# of the script were adding extra quote marks to the account's plist 
-# file located in /var/db/dslocal/nodes/Default/users/.
-#
-# Version 1.4
-#
-# Changes:
-#
-# macOS 10.14.4 will remove the the actual ShadowHashData key immediately 
-# if the AuthenticationAuthority array value which references the ShadowHash
-# is removed from the AuthenticationAuthority array. To address this, the
-# existing AuthenticationAuthority array will be modified to remove the Kerberos
-# and LocalCachedUser user values.
-#
-# Thanks to the anonymous reporter who provided the bug report and fix.
-#
-# Version 1.5
-#
-# Changes:
-#
-# 1. Removed the user prompts for unbinding the Mac from AD and granting admin rights to the local account.
-# 2. Added a check to see if the account is a mobile account before proceeding with the conversion process.
-# 3. Added a marker file to indicate that the migration has been completed successfully.
-# 4. Added error handling to ensure that the migration process is successful before creating the marker file.
-#
-# Version 1.6
-#
-# Changes:
-#
-# 1. Made work for the EnrollmentUser account in Workspace ONE UEM using Script Variables
-# 2. User permissions are now set to read-only for the staff group on the home directory
-# 3. Added Logging to the script
-#
-# Version 1.7
-#
-# Changes:
-#
-# 1. Added a check to see if the account is already a local account and AD is not bound before proceeding with the conversion process.
-# 2. Changed the chmod command to use the -RN flag to remove all ACLs from the home directory.
-#
-# Version 1.8
-#
-# Changes:
-#
-# 1. The converted account now matches a fresh local account. Only AD entries are removed from
-#    AuthenticationAuthority (ShadowHash, SecureToken and the local @LKDC Kerberos entry are kept).
-# 2. Added a FileVault guard and a backup of the account record before any change.
 
 clear
 username=$EnrollmentUser
