@@ -175,13 +175,15 @@ in_group() { # $1 = group, $2 = user
 
 # Prints one line for every way the account differs from a fresh local account.
 find_differences() {
-    local entry key gid mode shell
+    local entry kind key gid mode shell
     is_bound && echo "This Mac is still bound to Active Directory"
     while IFS= read -r entry; do
         [[ -n "$entry" ]] && is_ad_search_path "$entry" && echo "Active Directory is still in the search path"
     done < <(search_paths)
     while IFS= read -r entry; do
-        [[ -n "$entry" ]] && is_ad_authority_entry "$entry" && echo "AuthenticationAuthority has an AD entry"
+        # Name only the kind (";LocalCachedUser;..." -> LocalCachedUser), not the whole entry.
+        [[ -n "$entry" ]] && is_ad_authority_entry "$entry" && kind=${entry#;} &&
+            echo "AuthenticationAuthority has an AD entry: ${kind%%;*}"
     done < <(record_values "/Users/$username" AuthenticationAuthority)
     while IFS= read -r key; do
         [[ -n "$key" ]] && is_ad_attribute_key "$key" && echo "AD attribute remains: $key"
