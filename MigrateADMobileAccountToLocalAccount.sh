@@ -4,7 +4,7 @@
 # VerifyOnly=true (optional) only logs the differences from a fresh account and changes nothing.
 # Exit codes: 0 done (or nothing to do), 1 stopped, 2 differences from a fresh account remain (or VerifyOnly found some).
 # See the README for usage and credits.
-Version=1.8
+Version=1.9
 
 LOG_FILE="/var/log/mobile_to_local_migration.log"
 
@@ -34,6 +34,24 @@ FRESH_HOME_MODE=750
 
 is_stock_home_mode() {
     [[ "$1" == "$FRESH_HOME_MODE" || "$1" == "755" ]]
+}
+
+# A fresh account's ~/.CFUserTextEncoding mode. A mobile account's is 400.
+FRESH_TEXT_ENCODING_MODE=600
+
+# Keys that let the user change their own picture, input sources and unlock options. A fresh account
+# has _writers_<name> for each; a mobile account doesn't. They are permissions only, no data.
+WRITER_ATTRS=(AvatarRepresentation inputSources unlockOptions)
+
+# $1 = record keys (plist_keys output). Prints each WRITER_ATTRS name without a _writers_ key.
+missing_writers() {
+    local name
+    for name in "${WRITER_ATTRS[@]}"; do
+        case $'\n'"$1"$'\n' in
+            *$'\n'"dsAttrTypeNative:_writers_$name"$'\n'*) ;;
+            *) echo "$name" ;;
+        esac
+    done
 }
 
 # Prints the strings of the first array in a dscl -plist document, one per line.
@@ -175,7 +193,7 @@ in_group() { # $1 = group, $2 = user
 
 # Prints one line for every way the account differs from a fresh local account.
 find_differences() {
-    local entry kind key gid mode shell
+    local entry kind key keys name gid mode shell count
     is_bound && echo "This Mac is still bound to Active Directory"
     while IFS= read -r entry; do
         [[ -n "$entry" ]] && is_ad_search_path "$entry" && echo "Active Directory is still in the search path"
@@ -185,9 +203,13 @@ find_differences() {
         [[ -n "$entry" ]] && is_ad_authority_entry "$entry" && kind=${entry#;} &&
             echo "AuthenticationAuthority has an AD entry: ${kind%%;*}"
     done < <(record_values "/Users/$username" AuthenticationAuthority)
+    keys=$(plist_keys "$(dscl -plist . -read "/Users/$username" 2>/dev/null)")
     while IFS= read -r key; do
         [[ -n "$key" ]] && is_ad_attribute_key "$key" && echo "AD attribute remains: $key"
-    done < <(plist_keys "$(dscl -plist . -read "/Users/$username" 2>/dev/null)")
+    done <<<"$keys"
+    for name in $(missing_writers "$keys"); do
+        echo "The record has no _writers_$name; on a fresh account the user can change $name"
+    done
     while IFS= read -r entry; do
         [[ -n "$entry" ]] && is_ad_alt_identity "$entry" && echo "AltSecurityIdentities has an AD Kerberos principal"
     done < <(record_values "/Users/$username" AltSecurityIdentities)
@@ -210,6 +232,14 @@ find_differences() {
         is_stock_home_mode "$mode" || echo "Home folder mode is $mode, a fresh account uses $FRESH_HOME_MODE"
         [[ "$(stat -f %g "$homedir")" == "20" ]] || echo "Home folder group is not staff"
         home_acl_is_stock "$(ls -lde "$homedir")" || echo "Home folder ACL isn't just 'everyone deny delete'"
+        # After the unbind no AD group resolves, so -nogroup finds every one, not only the primary.
+        count=$(find "$homedir" -xdev -nogroup 2>/dev/null | grep -c .)
+        [[ "$count" -gt 0 ]] && echo "$count item(s) in the home folder still have an AD group"
+        if [[ -f "$homedir/.CFUserTextEncoding" ]]; then
+            mode=$(stat -f %Lp "$homedir/.CFUserTextEncoding")
+            [[ "$mode" == "$FRESH_TEXT_ENCODING_MODE" ]] ||
+                echo ".CFUserTextEncoding mode is $mode, a fresh account uses $FRESH_TEXT_ENCODING_MODE"
+        fi
     fi
 }
 
@@ -420,9 +450,23 @@ ResetShell() {
     fi
 }
 
-# Owner, group and permissions of the home folder, set to a stock macOS layout.
+# Lets the user change the values a fresh account lets them change. Adds no data.
+AddWriterPermissions() {
+    local name added=""
+    for name in $(missing_writers "$(plist_keys "$(dscl -plist . -read "/Users/$username" 2>/dev/null)")"); do
+        if dscl . -create "/Users/$username" "dsAttrTypeNative:_writers_$name" "$username"; then
+            added="$added $name"
+        else
+            log_message "WARN" "Could not add _writers_$name"
+        fi
+    done
+    [[ -n "$added" ]] && log_message "INFO" "Let the user change their own:$added"
+}
+
+# Owner, group and permissions of the home folder, set to a stock macOS layout. Runs after the
+# Directory Services restart, so AD groups no longer resolve and -nogroup finds them.
 FixHomeFolder() {
-    local mode
+    local mode count encoding match=(-nogroup)
     if [[ ! -d "$homedir" ]]; then
         log_message "WARN" "Home folder not found: $homedir"
         return 0
@@ -437,19 +481,31 @@ FixHomeFolder() {
         fi
     fi
 
-    # Files created while the account was an AD user carry the AD primary group. Only those are
-    # changed; the UID is unchanged so user ownership is already correct.
-    if [[ -n "$original_gid" && "$original_gid" != "20" ]]; then
+    # Files created while the account was an AD user carry the AD primary group, and some carry
+    # other AD groups. Only those are changed; the UID is unchanged so user ownership is already
+    # correct. Also runs on an account converted earlier (items macOS regrouped at the next login).
+    [[ -n "$original_gid" && "$original_gid" != "20" ]] && match=( \( -gid "$original_gid" -o -nogroup \) )
+    count=$(find "$homedir" -xdev "${match[@]}" 2>/dev/null | grep -c .)
+    if [[ "$count" -gt 0 ]]; then
         if [[ "$(basename "$homedir")" == "$username" ]]; then
-            if retry_fs find "$homedir" -xdev -gid "$original_gid" -exec chgrp -h 20 {} +; then
-                log_message "INFO" "Changed files in the home folder from group $original_gid to staff"
+            if retry_fs find "$homedir" -xdev "${match[@]}" -exec chgrp -h 20 {} +; then
+                log_message "INFO" "Changed $count item(s) in the home folder from an AD group to staff"
             elif fs_ok; then
-                log_message "INFO" "Changed the group on home folder files (skipped protected files)"
+                log_message "INFO" "Changed the group on $count home folder item(s) (skipped protected files)"
             else
                 log_message "WARN" "Could not change the group on all home folder files: ${FS_OUTPUT:0:200}"
             fi
         else
             log_message "WARN" "Skipped the group change: '$homedir' is not a folder named for $username"
+        fi
+    fi
+
+    encoding="$homedir/.CFUserTextEncoding"
+    if [[ -f "$encoding" && ! -L "$encoding" && "$(stat -f %Lp "$encoding")" != "$FRESH_TEXT_ENCODING_MODE" ]]; then
+        if retry_fs chmod "$FRESH_TEXT_ENCODING_MODE" "$encoding" || fs_ok; then
+            log_message "INFO" "Set the .CFUserTextEncoding mode to $FRESH_TEXT_ENCODING_MODE"
+        else
+            log_message "WARN" "Could not set the .CFUserTextEncoding mode: ${FS_OUTPUT:0:200}"
         fi
     fi
 
@@ -554,10 +610,11 @@ RemoveStaffListing
 GrantAdminRights
 ResetPrimaryGroup
 ResetShell
+AddWriterPermissions
 
-# Record changes are done. The rest touches the file system.
-FixHomeFolder
+# Record changes are done. Restart first so the AD groups no longer resolve, then fix the files.
 RestartDirectoryServices
+FixHomeFolder
 
 remaining=$(find_differences)
 CheckFileVaultIntact
