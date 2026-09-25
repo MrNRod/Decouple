@@ -1,7 +1,8 @@
 #!/bin/bash
 # Converts an Active Directory mobile account into a local account that matches a fresh local account.
 # EnrollmentUser = the account to convert. GrantAdmin=true (optional, default off) adds it to the admin group.
-# Exit codes: 0 done (or nothing to do), 1 stopped, 2 finished but differences from a fresh account remain.
+# VerifyOnly=true (optional) only logs the differences from a fresh account and changes nothing.
+# Exit codes: 0 done (or nothing to do), 1 stopped, 2 differences from a fresh account remain (or VerifyOnly found some).
 # See the README for usage and credits.
 Version=1.8
 
@@ -15,15 +16,25 @@ log_message() {
 # BEGIN helpers (pure text handling, unit tested in tests/test_filters.sh)
 
 # Attributes an AD mobile account adds and a local account never has (lower case, namespace stripped).
+# AppleMetaRecordName holds the AD distinguished name on a mobile account; a fresh one has none.
 # Deliberately NOT listed: AltSecurityIdentities (value-filtered), accountPolicyData (pwpolicy),
-# _writers_LinkedIdentity (Apple Account), AppleMeta* (virtual). A fresh account can have these.
+# _writers_LinkedIdentity (Apple Account), AppleMetaNodeLocation. A fresh account can have these.
 AD_ATTRS=(
     cachedgroups smbprimarygroupsid originalauthenticationauthority originalnodename smbsid
     smbscriptpath smbpasswordlastset smbgrouprid mcxsettings mcxflags accounttype copytimestamp
     account_instance cached_auth_policy cached_groups original_realname original_shell
     preserved_attributes email_address primaryntdomain firstname lastname jobtitle company
-    department emailaddress
+    department emailaddress applemetarecordname
 )
+
+# The shell and home folder mode of a fresh local account (macOS 27, checked against a new account).
+# Accounts made on older macOS have a 755 home folder, which is stock as well and left alone.
+FRESH_SHELL=/bin/zsh
+FRESH_HOME_MODE=750
+
+is_stock_home_mode() {
+    [[ "$1" == "$FRESH_HOME_MODE" || "$1" == "755" ]]
+}
 
 # Prints the strings of the first array in a dscl -plist document, one per line.
 attr_values_from_plist() {
@@ -90,12 +101,30 @@ is_ad_attribute_key() {
     return 1
 }
 
+# dscl prints a value stored as a binary plist as hex text ("62706c69 73743030 ..."). Prints the
+# value as XML plist text either way.
+HEX_VALUE='^[0-9a-fA-F]{8}( [0-9a-fA-F]{2,8})*$'
+plist_value_as_xml() {
+    if [[ "$1" =~ $HEX_VALUE ]]; then
+        printf '%s' "$1" | xxd -r -p | plutil -convert xml1 -o - - 2>/dev/null
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
+# accountPolicyData as XML. A mobile account stores it as a binary plist, a fresh one as XML.
+account_policy_xml() {
+    local outer
+    outer=$(dscl -plist . -read "/Users/$1" dsAttrTypeNative:accountPolicyData 2>/dev/null) || return 0
+    plist_value_as_xml "$(attr_values_from_plist "$outer")"
+}
+
 # Keys in accountPolicyData that a fresh account doesn't have (AD-imposed password rules).
 # A fresh account has only: creationTime, failedLoginCount, failedLoginTimestamp, passwordLastSetTime.
 extra_policy_keys() {
-    local outer inner key
-    outer=$(dscl -plist . -read "/Users/$1" dsAttrTypeNative:accountPolicyData 2>/dev/null) || return 0
-    inner=$(attr_values_from_plist "$outer")
+    local inner key
+    inner=$(account_policy_xml "$1")
+    [[ -n "$inner" ]] || return 0
     while IFS= read -r key; do
         case "$key" in
             "" | creationTime | failedLoginCount | failedLoginTimestamp | passwordLastSetTime) ;;
@@ -112,7 +141,13 @@ home_acl_is_stock() {
     [[ "$count" -eq 1 ]] && printf '%s\n' "$1" | grep -q 'group:everyone deny delete'
 }
 
-# True for GrantAdmin values that switch the option on.
+# True if the shell is the one AD assigned (it still equals original_shell) and not the fresh one.
+# $1 = UserShell, $2 = original_shell. A shell the user picked later is kept.
+is_ad_shell() {
+    [[ -n "$2" && "$1" == "$2" && "$1" != "$FRESH_SHELL" ]]
+}
+
+# True for GrantAdmin / VerifyOnly values that switch the option on.
 is_enabled() {
     case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
         true | yes | 1) return 0 ;;
@@ -140,7 +175,7 @@ in_group() { # $1 = group, $2 = user
 
 # Prints one line for every way the account differs from a fresh local account.
 find_differences() {
-    local entry key gid mode
+    local entry key gid mode shell
     is_bound && echo "This Mac is still bound to Active Directory"
     while IFS= read -r entry; do
         [[ -n "$entry" ]] && is_ad_search_path "$entry" && echo "Active Directory is still in the search path"
@@ -159,12 +194,18 @@ find_differences() {
     done < <(record_values "/Users/$username" RecordName)
     gid=$(dscl . -read "/Users/$username" PrimaryGroupID 2>/dev/null | awk '{print $2}')
     [[ "$gid" == "20" ]] || echo "PrimaryGroupID is $gid, a fresh account uses 20"
+    shell=$(record_values "/Users/$username" UserShell)
+    is_ad_shell "$shell" "$(record_values "/Users/$username" dsAttrTypeNative:original_shell)" &&
+        echo "UserShell is $shell (set by AD), a fresh account uses $FRESH_SHELL"
+    # Membership comes from the AuthenticationAuthority; a local account is in localaccounts (61).
+    dseditgroup -o checkmember -m "$username" netaccounts 2>/dev/null | grep -q '^yes' &&
+        echo "The user is in netaccounts (network account); a fresh account is in localaccounts"
     [[ -n "$(extra_policy_keys "$username")" ]] && echo "Account policy still has AD rules"
     [[ -n "$(record_values /Groups/admin NestedGroups)" ]] && echo "The admin group has nested (AD) groups"
     in_group staff "$username" && echo "The user is listed in the staff group; on a fresh account only root is"
     if [[ -d "$homedir" ]]; then
         mode=$(stat -f %Lp "$homedir")
-        [[ "$mode" == "755" ]] || echo "Home folder mode is $mode, a fresh account uses 755"
+        is_stock_home_mode "$mode" || echo "Home folder mode is $mode, a fresh account uses $FRESH_HOME_MODE"
         [[ "$(stat -f %g "$homedir")" == "20" ]] || echo "Home folder group is not staff"
         home_acl_is_stock "$(ls -lde "$homedir")" || echo "Home folder ACL isn't just 'everyone deny delete'"
     fi
@@ -220,12 +261,15 @@ CheckFileVaultIntact() {
     fi
 }
 
-# Restore point written before any change. The password hash is never included.
+# Restore point written before any change. The password hash and the keys derived from the
+# password are never included.
 BackupAccountRecord() {
-    local file
+    local file key
     file="/var/log/mobile_to_local_backup_${username}_$(date +%s).plist"
     if ( umask 077; dscl -plist . -read "/Users/$username" > "$file" ); then
-        plutil -remove 'dsAttrTypeNative:ShadowHashData' "$file" 2>/dev/null
+        for key in ShadowHashData KerberosKeys HeimdalSRPKey; do
+            plutil -remove "dsAttrTypeNative:$key" "$file" 2>/dev/null
+        done
         plutil -insert '_dsconfigad_show' -string "$(dsconfigad -show 2>&1)" "$file" 2>/dev/null
         chmod 600 "$file"
         log_message "INFO" "Backed up the account record to $file"
@@ -301,14 +345,30 @@ RemoveADAttributes() {
     [[ $removed -gt 0 ]] && log_message "INFO" "Removed $removed AD attribute(s):$names"
 }
 
-# Clear AD-imposed password rules (expiry etc.). Only when there are any, so a fresh
-# account's own policy data (creation time etc.) is left alone.
+# Clear AD-imposed password rules (expiry, history, last-login tracking). Only when there are any,
+# so a fresh account's own policy data (creation time etc.) is left alone. pwpolicy removes the
+# rules; keys it leaves are removed by writing the data back without them (as XML, like a fresh
+# account stores it).
 ClearAccountPolicies() {
-    [[ -n "$(extra_policy_keys "$username")" ]] || return 0
-    if pwpolicy -n /Local/Default -u "$username" -clearaccountpolicies &>/dev/null; then
+    local extra key file
+    extra=$(extra_policy_keys "$username")
+    [[ -n "$extra" ]] || return 0
+    pwpolicy -n /Local/Default -u "$username" -clearaccountpolicies &>/dev/null
+    extra=$(extra_policy_keys "$username")
+    if [[ -n "$extra" ]]; then
+        file=$(mktemp)
+        account_policy_xml "$username" > "$file"
+        while IFS= read -r key; do
+            plutil -remove "$key" "$file" &>/dev/null
+        done <<<"$extra"
+        plutil -lint -s "$file" && dscl . -create "/Users/$username" dsAttrTypeNative:accountPolicyData "$(cat "$file")"
+        rm -f "$file"
+    fi
+    extra=$(extra_policy_keys "$username")
+    if [[ -z "$extra" ]]; then
         log_message "INFO" "Cleared AD account policies"
     else
-        log_message "WARN" "Could not clear AD account policies"
+        log_message "WARN" "Could not clear AD account policies: $(printf '%s' "$extra" | tr '\n' ' ')"
     fi
 }
 
@@ -347,6 +407,17 @@ ResetPrimaryGroup() {
     fi
 }
 
+# Only a shell AD assigned is reset; one the user picked is kept. Uses the values read before
+# RemoveADAttributes deleted original_shell.
+ResetShell() {
+    is_ad_shell "$original_shell" "$ad_shell" || return 0
+    if dscl . -create "/Users/$username" UserShell "$FRESH_SHELL"; then
+        log_message "INFO" "Reset UserShell from $original_shell (set by AD) to $FRESH_SHELL"
+    else
+        log_message "WARN" "Could not reset UserShell"
+    fi
+}
+
 # Owner, group and permissions of the home folder, set to a stock macOS layout.
 FixHomeFolder() {
     local mode
@@ -381,9 +452,9 @@ FixHomeFolder() {
     fi
 
     mode=$(stat -f %Lp "$homedir")
-    if [[ "$mode" != "755" ]]; then
-        if retry_fs chmod 755 "$homedir" || fs_ok; then
-            log_message "INFO" "Set the home folder mode to 755 (was $mode)"
+    if ! is_stock_home_mode "$mode"; then
+        if retry_fs chmod "$FRESH_HOME_MODE" "$homedir" || fs_ok; then
+            log_message "INFO" "Set the home folder mode to $FRESH_HOME_MODE (was $mode)"
         else
             log_message "WARN" "Could not set the home folder mode: ${FS_OUTPUT:0:200}"
         fi
@@ -424,6 +495,7 @@ fi
 
 username=$EnrollmentUser
 GrantAdmin=${GrantAdmin:-false}
+VerifyOnly=${VerifyOnly:-false}
 
 if [[ ! "$username" =~ ^[A-Za-z0-9._-]{1,64}$ || "$username" == -* ]]; then
     log_message "ERROR" "Invalid target user name: '$username'"
@@ -439,6 +511,8 @@ log_message "INFO" "MigrateADMobileAccountToLocalAccount $Version: $username, ma
 uid=$(id -u "$username")
 homedir=$(dscl . -read "/Users/$username" NFSHomeDirectory | sed 's/^NFSHomeDirectory: //')
 original_gid=$(dscl . -read "/Users/$username" PrimaryGroupID | awk '{print $2}')
+original_shell=$(record_values "/Users/$username" UserShell)
+ad_shell=$(record_values "/Users/$username" dsAttrTypeNative:original_shell)
 
 differences=$(find_differences)
 if [[ -z "$differences" ]]; then
@@ -448,6 +522,10 @@ fi
 while IFS= read -r line; do
     log_message "INFO" "Found: $line"
 done <<<"$differences"
+if is_enabled "$VerifyOnly"; then
+    log_message "INFO" "Verify only: nothing was changed"
+    exit 2
+fi
 
 # What decides which steps run, captured before anything changes.
 is_bound && was_bound=1 || was_bound=0
@@ -473,6 +551,7 @@ ClearAccountPolicies
 RemoveStaffListing
 GrantAdminRights
 ResetPrimaryGroup
+ResetShell
 
 # Record changes are done. The rest touches the file system.
 FixHomeFolder
