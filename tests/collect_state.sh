@@ -143,8 +143,11 @@ if [[ -d "$home" ]]; then
     errors=$(mktemp)
     not_staff=$(find "$home" -xdev ! -group staff 2>>"$errors")
     not_owned=$(find "$home" -xdev ! -user "$user" 2>>"$errors")
+    # A group that no longer resolves: after the unbind, every AD group.
+    no_group=$(find "$home" -xdev -nogroup 2>>"$errors")
     out "home.count.not_group_staff" "$(printf '%s' "$not_staff" | grep -c .)"
     out "home.count.not_owned_by_user" "$(printf '%s' "$not_owned" | grep -c .)"
+    out "home.count.unresolved_group" "$(printf '%s' "$no_group" | grep -c .)"
     printf '%s\n' "$not_staff" | grep . | head -5 | norm | sed 's/^/# not group staff: /'
     printf '%s\n' "$not_owned" | grep . | head -5 | norm | sed 's/^/# not owned by user: /'
     echo "# find could not read $(grep -c . "$errors") path(s) (TCC/SIP; give Terminal Full Disk Access to include them)"
