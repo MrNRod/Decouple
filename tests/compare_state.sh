@@ -11,8 +11,8 @@ if [[ ! -r "$fresh" || ! -r "$converted" ]]; then
     exit 2
 fi
 
-# Keys whose values must differ between two accounts: names, picture, timestamps.
-IGNORE='^record\.dsAttrTypeStandard:(RealName|Picture|JPEGPhoto)$'
+# Keys whose values must differ between two accounts: names, picture, shell history.
+IGNORE='^record\.dsAttrTypeStandard:(RealName|Picture|JPEGPhoto)$|^item\.\.(zsh|bash)_(history|sessions)\.'
 
 differences=$(awk -v ignore="$IGNORE" '
     FNR == 1 { file++ }

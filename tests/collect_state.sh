@@ -28,6 +28,8 @@ norm() {
 
 out() { printf '%s = %s\n' "$1" "$2"; }
 
+HEX='^[0-9a-fA-F]{8}( [0-9a-fA-F]{2,8})*$'
+
 # Values of one record key: strings as text, data as <data> (hashes, keys, photos).
 key_values() { # $1 = key
     local base="//dict/key[.='$1']/following-sibling::array[1]" n i v
@@ -35,6 +37,7 @@ key_values() { # $1 = key
     for ((i = 1; i <= n; i++)); do
         v=$(xmllint --xpath "string(($base/string)[$i])" - <<<"$record")
         [[ "$v" == *$'\n'* ]] && v="<multi-line text>" # embedded plists (MCX, cached policy)
+        [[ "$v" =~ $HEX ]] && v="<data>"                # as root dscl prints data as hex text
         printf '%s\n' "$v"
     done
     n=$(xmllint --xpath "count($base/data)" - <<<"$record" 2>/dev/null)
@@ -47,6 +50,7 @@ authority_kind() {
     kind=$(printf '%s' "$1" | awk -F';' '{print $2}')
     case "$kind" in
         Kerberosv5) [[ "$1" == *LKDC:* ]] && echo "Kerberosv5 (LKDC)" || echo "Kerberosv5 (AD)" ;;
+        ShadowHash) echo "ShadowHash $(printf '%s' "$1" | awk -F';' '{print $3}')" ;; # hash types, not hashes
         *) echo "$kind" ;;
     esac
 }
@@ -71,9 +75,12 @@ for ((i = 1; i <= n; i++)); do
             key_values "$key" | while IFS= read -r v; do out "record.$key" "$(authority_kind "$v")"; done ;;
         *:AltSecurityIdentities)
             key_values "$key" | while IFS= read -r v; do out "record.$key" "$(alt_identity_kind "$v")"; done ;;
+        *:ShadowHashData | *:KerberosKeys | *:HeimdalSRPKey | *:JPEGPhoto)
+            out "record.$key" "<redacted>" ;; # password-derived (and photo bytes); never printed
         *:accountPolicyData)
-            # Only the keys: the values are timestamps and counters.
-            inner=$(key_values "$key")
+            # Only the keys: the values are timestamps and counters. As root the value is hex bytes.
+            inner=$(xmllint --xpath "string(//dict/key[.='$key']/following-sibling::array[1]/string[1])" - <<<"$record")
+            [[ "$inner" =~ $HEX ]] && inner=$(printf '%s' "$inner" | xxd -r -p | plutil -convert xml1 -o - - 2>/dev/null)
             m=$(xmllint --xpath 'count(/plist/dict/key)' - <<<"$inner" 2>/dev/null)
             for ((j = 1; j <= m; j++)); do
                 out "policy.key" "$(xmllint --xpath "string(/plist/dict/key[$j])" - <<<"$inner")"
@@ -83,8 +90,6 @@ for ((i = 1; i <= n; i++)); do
             vals=$(key_values "$key")
             if [[ -z "$vals" ]]; then
                 out "record.$key" "<empty>"
-            elif [[ "$key" == *JPEGPhoto* ]]; then
-                out "record.$key" "<present>" # photo bytes (hex text without root)
             else
                 printf '%s\n' "$vals" | while IFS= read -r v; do out "record.$key" "${v:0:200}"; done
             fi ;;
