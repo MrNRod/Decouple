@@ -24,7 +24,7 @@ AD_ATTRS=(
     smbscriptpath smbpasswordlastset smbgrouprid mcxsettings mcxflags accounttype copytimestamp
     account_instance cached_auth_policy cached_groups original_realname original_shell
     preserved_attributes email_address primaryntdomain firstname lastname jobtitle company
-    department emailaddress applemetarecordname
+    department emailaddress applemetarecordname originalnfshomedirectory
 )
 
 # The shell and home folder mode of a fresh local account (macOS 27, checked against a new account).
