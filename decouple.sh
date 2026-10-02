@@ -2,15 +2,97 @@
 # Converts an Active Directory mobile account into a local account that matches a fresh local account.
 # EnrollmentUser = the account to convert. GrantAdmin=true (optional, default off) adds it to the admin group.
 # VerifyOnly=true (optional) only logs the differences from a fresh account and changes nothing.
+# UseDialog=true (optional) shows progress in swiftDialog if /usr/local/bin/dialog is installed.
 # Exit codes: 0 done (or nothing to do), 1 stopped, 2 differences from a fresh account remain (or VerifyOnly found some).
 # See the README for usage and credits.
-Version=1.9
+Version=2.0  # Decouple
 
-LOG_FILE="/var/log/mobile_to_local_migration.log"
+LOG_FILE="/var/log/decouple.log"
 
 # Levels: INFO = what happened, WARN = a problem the run continues past, ERROR = the run stopped.
 log_message() {
     printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" | tee -a "$LOG_FILE"
+}
+
+# --- swiftDialog (optional) ---------------------------------------------------------------
+# If /usr/local/bin/dialog is installed and UseDialog=true, shows a progress dialog.
+# If not, every dialog_* function is a silent no-op and the script runs headless.
+DIALOG_BIN="/usr/local/bin/dialog"
+DIALOG_CMD_FILE=""
+DIALOG_PID=""
+DIALOG_ENABLED=0
+
+dialog_init() {
+    is_enabled "${UseDialog:-false}" || return 0
+    [[ -x "$DIALOG_BIN" ]] || { log_message "INFO" "UseDialog=true but swiftDialog not found at $DIALOG_BIN; running headless"; return 0; }
+    # No GUI at the login window.
+    local console_user; console_user=$(stat -f%Su /dev/console 2>/dev/null)
+    [[ "$console_user" != "loginwindow" && -n "$console_user" ]] || { log_message "INFO" "No console user; running headless"; return 0; }
+    DIALOG_CMD_FILE="/var/tmp/adtl_dialog_${username}_$$.log"
+    : > "$DIALOG_CMD_FILE"
+    chmod 644 "$DIALOG_CMD_FILE"
+    DIALOG_ENABLED=1
+}
+
+dialog_start() { # $1 = title, $2 = message, rest = step names
+    [[ $DIALOG_ENABLED -eq 1 ]] || return 0
+    local title="$1" message="$2"; shift 2
+    local steps=("$@") list_args=() i=0
+    for step in "$@"; do
+        list_args+=( --listitem "$step" )
+    done
+    local console_user console_uid
+    console_user=$(stat -f%Su /dev/console)
+    console_uid=$(id -u "$console_user")
+    launchctl asuser "$console_uid" sudo -u "$console_user" "$DIALOG_BIN" \
+        --title "$title" \
+        --message "$message" \
+        --icon "SF=person.crop.circle.badge.checkmark" \
+        --progress "${#steps[@]}" \
+        --progresstext "Starting..." \
+        --button1text "Working..." --button1disabled \
+        --commandfile "$DIALOG_CMD_FILE" \
+        --moveable --ontop --hidedefaultkeyboardaction \
+        "${list_args[@]}" &>/dev/null &
+    DIALOG_PID=$!
+    # Give swiftDialog time to open the command file before we write to it.
+    sleep 1
+}
+
+dialog_step() { # $1 = index (0-based), $2 = status (wait/success/error/fail), $3 = text
+    [[ $DIALOG_ENABLED -eq 1 ]] || return 0
+    echo "listitem: index: $1, status: $2, statustext: $(dialog_sanitize "$3")" >> "$DIALOG_CMD_FILE"
+}
+
+dialog_progress() { # $1 = completed count, $2 = text
+    [[ $DIALOG_ENABLED -eq 1 ]] || return 0
+    echo "progress: $1" >> "$DIALOG_CMD_FILE"
+    echo "progresstext: $(dialog_sanitize "$2")" >> "$DIALOG_CMD_FILE"
+}
+
+dialog_finish() { # $1 = title, $2 = message, enables the Close button
+    [[ $DIALOG_ENABLED -eq 1 ]] || return 0
+    echo "title: $(dialog_sanitize "$1")" >> "$DIALOG_CMD_FILE"
+    echo "message: $(dialog_sanitize "$2")" >> "$DIALOG_CMD_FILE"
+    echo "button1text: Close" >> "$DIALOG_CMD_FILE"
+    echo "button1: enable" >> "$DIALOG_CMD_FILE"
+}
+
+dialog_close() {
+    [[ $DIALOG_ENABLED -eq 1 ]] || return 0
+    echo "quit:" >> "$DIALOG_CMD_FILE"
+    sleep 1
+    rm -f "$DIALOG_CMD_FILE"
+    DIALOG_ENABLED=0
+}
+
+# swiftDialog splits command-file lines on commas and colons. Keep text on one line and strip those.
+dialog_sanitize() {
+    local text="$1"
+    text="${text//$'\r'/ }"
+    text="${text//$'\n'/ }"
+    text="${text//,/;}"
+    printf '%s' "${text:0:140}"
 }
 
 # BEGIN helpers (pure text handling, unit tested in tests/test_filters.sh)
@@ -297,7 +379,7 @@ CheckFileVaultIntact() {
 # password are never included.
 BackupAccountRecord() {
     local file key
-    file="/var/log/mobile_to_local_backup_${username}_$(date +%s).plist"
+    file="/var/log/decouple_backup_${username}_$(date +%s).plist"
     if ( umask 077; dscl -plist . -read "/Users/$username" > "$file" ); then
         for key in ShadowHashData KerberosKeys HeimdalSRPKey; do
             plutil -remove "dsAttrTypeNative:$key" "$file" 2>/dev/null
@@ -551,11 +633,12 @@ if [[ $EUID -ne 0 ]]; then
     echo "This script must be run as root."
     exit 1
 fi
-[[ -e "$LOG_FILE" ]] || ( umask 077; : > "$LOG_FILE" )
+[[ -e "$LOG_FILE" ]] || ( umask 022; : > "$LOG_FILE" )
 
 username=$EnrollmentUser
 GrantAdmin=${GrantAdmin:-false}
 VerifyOnly=${VerifyOnly:-false}
+UseDialog=${UseDialog:-false}
 
 if [[ ! "$username" =~ ^[A-Za-z0-9._-]{1,64}$ || "$username" == -* ]]; then
     log_message "ERROR" "Invalid target user name: '$username'"
@@ -566,7 +649,8 @@ if ! dscl . -read "/Users/$username" &>/dev/null; then
     exit 1
 fi
 
-log_message "INFO" "MigrateADMobileAccountToLocalAccount $Version: $username, macOS $(sw_vers -productVersion)"
+log_message "INFO" "Decouple $Version: $username, macOS $(sw_vers -productVersion)"
+dialog_init
 
 uid=$(id -u "$username")
 homedir=$(dscl . -read "/Users/$username" NFSHomeDirectory | sed 's/^NFSHomeDirectory: //')
@@ -577,6 +661,14 @@ ad_shell=$(record_values "/Users/$username" dsAttrTypeNative:original_shell)
 differences=$(find_differences)
 if [[ -z "$differences" ]]; then
     log_message "INFO" "No Active Directory traces found. Nothing to do."
+    if [[ $DIALOG_ENABLED -eq 1 ]]; then
+        dialog_start "AD to Local: $username" "No Active Directory traces found." "Check Account"
+        dialog_step 0 success "Already a local account"
+        dialog_progress 1 "Already a local account"
+        dialog_finish "Already a Local Account" "No Active Directory traces were found. Nothing to change."
+        wait "$DIALOG_PID" 2>/dev/null
+        dialog_close
+    fi
     exit 0
 fi
 while IFS= read -r line; do
@@ -584,6 +676,14 @@ while IFS= read -r line; do
 done <<<"$differences"
 if is_enabled "$VerifyOnly"; then
     log_message "INFO" "Verify only: nothing was changed"
+    if [[ $DIALOG_ENABLED -eq 1 ]]; then
+        dialog_start "AD to Local: $username" "Differences found (verify only, nothing changed)." \
+            "Verify Only" "$differences"
+        dialog_finish "Verify Only" "$(printf '%s\n' "$differences" | head -5)... See the log for details."
+        # Wait for the user to close the dialog.
+        wait "$DIALOG_PID" 2>/dev/null
+        dialog_close
+    fi
     exit 2
 fi
 
@@ -594,18 +694,54 @@ while IFS= read -r entry; do
     is_ad_authority_entry "$entry" && was_mobile=1
 done < <(record_values "/Users/$username" AuthenticationAuthority)
 
+# Build the step list for the dialog (only the steps that will actually run).
+dialog_steps=()
+dialog_steps+=("Back Up Account Record")
+[[ $was_bound -eq 1 ]] && dialog_steps+=("Unbind from Active Directory")
+[[ $was_bound -eq 1 || "$differences" == *"in the search path"* ]] && dialog_steps+=("Clean Search Paths")
+[[ $was_mobile -eq 1 ]] && dialog_steps+=("Remove AD Authentication Entries")
+dialog_steps+=("Remove AD Attributes and Identities")
+dialog_steps+=("Reset Groups and Shell")
+dialog_steps+=("Restart Directory Services")
+dialog_steps+=("Fix Home Folder")
+dialog_steps+=("Verify Against Fresh Account")
+
+dialog_start "AD to Local: $username" "Converting $username to a local account. Do not restart or power off." "${dialog_steps[@]}"
+
+# Track the current step index for dialog updates.
+di=0
+dialog_running() { dialog_step "$di" wait "$1"; }
+dialog_done()    { dialog_step "$di" success "$1"; dialog_progress "$((di + 1))" "$2"; di=$((di + 1)); }
+dialog_warn()    { dialog_step "$di" error "$1"; dialog_progress "$((di + 1))" "$2"; di=$((di + 1)); }
+
+dialog_running "Backing up..."
 CaptureFileVaultState
 BackupAccountRecord
+dialog_done "Backed up" "Back Up Account Record"
 
-[[ $was_bound -eq 1 ]] && UnbindFromAD
-[[ $was_bound -eq 1 || "$differences" == *"in the search path"* ]] && ResetSearchPaths
+if [[ $was_bound -eq 1 ]]; then
+    dialog_running "Unbinding..."
+    UnbindFromAD
+    dialog_done "Unbound" "Unbind from Active Directory"
+fi
+if [[ $was_bound -eq 1 || "$differences" == *"in the search path"* ]]; then
+    dialog_running "Cleaning search paths..."
+    ResetSearchPaths
+    dialog_done "Search paths cleaned" "Clean Search Paths"
+fi
 if [[ $was_mobile -eq 1 ]]; then
+    dialog_running "Removing AD authority entries..."
     RemoveMatchingValues AuthenticationAuthority is_ad_authority_entry
     CheckFileVaultIntact
+    dialog_done "AD entries removed" "Remove AD Authentication Entries"
 fi
+dialog_running "Removing AD attributes..."
 RemoveADAttributes
 RemoveMatchingValues AltSecurityIdentities is_ad_alt_identity
 RemoveMatchingValues RecordName is_domain_alias
+dialog_done "Attributes removed" "Remove AD Attributes and Identities"
+
+dialog_running "Clearing policies and tickets..."
 ClearAccountPolicies
 [[ $was_mobile -eq 1 ]] && DestroyKerberosTickets
 RemoveStaffListing
@@ -613,19 +749,33 @@ GrantAdminRights
 ResetPrimaryGroup
 ResetShell
 AddWriterPermissions
+dialog_done "Groups and shell reset" "Reset Groups and Shell"
 
-# Record changes are done. Restart first so the AD groups no longer resolve, then fix the files.
+dialog_running "Restarting Directory Services..."
 RestartDirectoryServices
-FixHomeFolder
+dialog_done "Restarted" "Restart Directory Services"
 
+dialog_running "Fixing home folder..."
+FixHomeFolder
+dialog_done "Home folder fixed" "Fix Home Folder"
+
+dialog_running "Verifying..."
 remaining=$(find_differences)
 CheckFileVaultIntact
 if [[ -z "$remaining" ]]; then
     log_message "INFO" "Done: $username matches a fresh local account"
+    dialog_done "Matches a fresh account" "Verify Against Fresh Account"
+    dialog_finish "Migration Successful" "$username is now a local account. Restart to confirm the login still works."
+    wait "$DIALOG_PID" 2>/dev/null
+    dialog_close
     exit 0
 fi
 while IFS= read -r line; do
     log_message "WARN" "Still different: $line"
 done <<<"$remaining"
 log_message "WARN" "Finished with differences from a fresh local account"
+dialog_warn "Differences remain" "Verify Against Fresh Account"
+dialog_finish "Completed With Warnings" "Some differences remain. See the log: $LOG_FILE"
+wait "$DIALOG_PID" 2>/dev/null
+dialog_close
 exit 2
