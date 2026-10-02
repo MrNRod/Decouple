@@ -61,6 +61,16 @@ the migration. The LKDC then creates the missing entries. Running the script aga
 
 Everything is logged to `/var/log/mobile_to_local_migration.log` (root-only) and to the console, one line per action. There are three levels: `INFO` (what happened), `WARN` (a problem the run continues past) and `ERROR` (the run stopped).
 
+## swiftDialog (optional)
+
+Set `UseDialog=true` to show a progress dialog during the migration. Requires [swiftDialog](https://github.com/swiftDialog/swiftDialog) (`/usr/local/bin/dialog`) to be pre-installed, typically deployed via MDM as a `.pkg`.
+
+The dialog shows a list item for each step with live status (running, success, warning), a progress bar, and a Close button that enables when the migration finishes. If swiftDialog is not installed or no user is at the console, the script runs headless (logging to the log file only).
+
+```bash
+sudo UseDialog=true EnrollmentUser="username" ./MigrateADMobileAccountToLocalAccount.sh
+```
+
 ## Testing
 
 Tests for the parsing and filtering helpers, and for the detection logic against a stubbed mobile account and this Mac's real account (read-only). Run with the macOS bash:
