@@ -1,8 +1,8 @@
-# AD Account Migration
+# Decouple
 
 ## Description
 
-The AD Account Migration script converts an Active Directory (AD) mobile account on macOS into a local account that matches a fresh local account. This is useful for detaching a Mac from AD while preserving the user's home folder and settings. It does the same work as the ADToLocal app.
+Decouple converts an Active Directory (AD) mobile account on macOS into a local account that matches a fresh local account. This is useful for detaching a Mac from AD while preserving the user's home folder and settings. It does the same work as the ADToLocal app.
 
 ## Usage
 
@@ -10,7 +10,7 @@ The script must run as root. It changes nothing and exits if the account already
 
 ### Terminal
 ```bash
-sudo EnrollmentUser="username" ./MigrateADMobileAccountToLocalAccount.sh
+sudo EnrollmentUser="username" ./decouple.sh
 ```
 
 ### MDM (Mobile Device Management)
@@ -34,7 +34,7 @@ Upload the script to your MDM and set the variables in its execution environment
 Only the steps the account needs are run, in this order:
 
 1. **Compare** the account with a fresh local account. Nothing to fix means nothing is changed.
-2. **Back up** the account record to `/var/log/mobile_to_local_backup_<user>_<time>.plist` (root-only, no password hash).
+2. **Back up** the account record to `/var/log/decouple_backup_<user>_<time>.plist` (root-only, no password hash).
 3. **Unbind** the Mac from AD (with retries and a check), remove AD from the search paths and set the search policy back to Automatic.
 4. **Authentication authority:** remove only the AD entries (`LocalCachedUser`, AD `Kerberosv5`). `ShadowHash`, `SecureToken` and the local `@LKDC` Kerberos entry are never removed, so the local password and the FileVault login keep working. The run stops if the `SecureToken` or FileVault crypto-user entry disappears.
 5. **Attributes:** remove the AD attributes that are present (including `AppleMetaRecordName`, the AD distinguished name), the AD Kerberos values in `AltSecurityIdentities` and `user@DOMAIN` aliases in `RecordName`. An Apple Account's values are kept.
@@ -59,7 +59,7 @@ the migration. The LKDC then creates the missing entries. Running the script aga
 
 ## Logging
 
-Everything is logged to `/var/log/mobile_to_local_migration.log` (root-only) and to the console, one line per action. There are three levels: `INFO` (what happened), `WARN` (a problem the run continues past) and `ERROR` (the run stopped).
+Everything is logged to `/var/log/decouple.log` (root-only) and to the console, one line per action. There are three levels: `INFO` (what happened), `WARN` (a problem the run continues past) and `ERROR` (the run stopped).
 
 ## swiftDialog (optional)
 
@@ -68,7 +68,7 @@ Set `UseDialog=true` to show a progress dialog during the migration. Requires [s
 The dialog shows a list item for each step with live status (running, success, warning), a progress bar, and a Close button that enables when the migration finishes. If swiftDialog is not installed or no user is at the console, the script runs headless (logging to the log file only).
 
 ```bash
-sudo UseDialog=true EnrollmentUser="username" ./MigrateADMobileAccountToLocalAccount.sh
+sudo UseDialog=true EnrollmentUser="username" ./decouple.sh
 ```
 
 ## Testing
