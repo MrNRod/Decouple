@@ -29,6 +29,7 @@ dialog_init() {
     local console_user; console_user=$(stat -f%Su /dev/console 2>/dev/null)
     [[ "$console_user" != "loginwindow" && -n "$console_user" ]] || { log_message "INFO" "No console user; running headless"; return 0; }
     DIALOG_CMD_FILE=$(mktemp -t adtl_dialog)
+    chmod 644 "$DIALOG_CMD_FILE"
     DIALOG_ENABLED=1
 }
 
