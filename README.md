@@ -72,6 +72,8 @@ The dialog shows a list item for each step with live status (running, success, w
 sudo UseDialog=true EnrollmentUser="username" ./decouple.sh
 ```
 
+*Note on swiftDialog versions: swiftDialog v3 requires macOS 15 or later. On macOS 14 install [v2.5.6](https://github.com/swiftDialog/swiftDialog/releases/tag/v2.5.6) instead.*
+
 ## Testing
 
 Tests for the parsing and filtering helpers, and for the detection logic against a stubbed mobile account and this Mac's real account (read-only). Run with the macOS bash:
