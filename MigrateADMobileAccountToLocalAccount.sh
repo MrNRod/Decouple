@@ -2,15 +2,94 @@
 # Converts an Active Directory mobile account into a local account that matches a fresh local account.
 # EnrollmentUser = the account to convert. GrantAdmin=true (optional, default off) adds it to the admin group.
 # VerifyOnly=true (optional) only logs the differences from a fresh account and changes nothing.
+# UseDialog=true (optional) shows progress in swiftDialog if /usr/local/bin/dialog is installed.
 # Exit codes: 0 done (or nothing to do), 1 stopped, 2 differences from a fresh account remain (or VerifyOnly found some).
 # See the README for usage and credits.
-Version=1.9
+Version=2.0
 
 LOG_FILE="/var/log/mobile_to_local_migration.log"
 
 # Levels: INFO = what happened, WARN = a problem the run continues past, ERROR = the run stopped.
 log_message() {
     printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" | tee -a "$LOG_FILE"
+}
+
+# --- swiftDialog (optional) ---------------------------------------------------------------
+# If /usr/local/bin/dialog is installed and UseDialog=true, shows a progress dialog.
+# If not, every dialog_* function is a silent no-op and the script runs headless.
+DIALOG_BIN="/usr/local/bin/dialog"
+DIALOG_CMD_FILE=""
+DIALOG_PID=""
+DIALOG_ENABLED=0
+
+dialog_init() {
+    is_enabled "${UseDialog:-false}" || return 0
+    [[ -x "$DIALOG_BIN" ]] || { log_message "INFO" "UseDialog=true but swiftDialog not found at $DIALOG_BIN; running headless"; return 0; }
+    # No GUI at the login window.
+    local console_user; console_user=$(stat -f%Su /dev/console 2>/dev/null)
+    [[ "$console_user" != "loginwindow" && -n "$console_user" ]] || { log_message "INFO" "No console user; running headless"; return 0; }
+    DIALOG_CMD_FILE=$(mktemp -t adtl_dialog)
+    DIALOG_ENABLED=1
+}
+
+dialog_start() { # $1 = title, $2 = message, rest = step names
+    [[ $DIALOG_ENABLED -eq 1 ]] || return 0
+    local title="$1" message="$2"; shift 2
+    local steps=("$@") list_args=() i=0
+    for step in "$@"; do
+        list_args+=( --listitem "$step" )
+    done
+    : > "$DIALOG_CMD_FILE"
+    local console_user console_uid
+    console_user=$(stat -f%Su /dev/console)
+    console_uid=$(id -u "$console_user")
+    launchctl asuser "$console_uid" sudo -u "$console_user" "$DIALOG_BIN" \
+        --title "$title" \
+        --message "$message" \
+        --icon "SF=person.crop.circle.badge.checkmark" \
+        --progress "${#steps[@]}" \
+        --progresstext "Starting..." \
+        --button1text "Working..." --button1disabled \
+        --commandfile "$DIALOG_CMD_FILE" \
+        --moveable --ontop --hidedefaultkeyboardaction \
+        "${list_args[@]}" &>/dev/null &
+    DIALOG_PID=$!
+}
+
+dialog_step() { # $1 = index (0-based), $2 = status (wait/success/error/fail), $3 = text
+    [[ $DIALOG_ENABLED -eq 1 ]] || return 0
+    echo "listitem: index: $1, status: $2, statustext: $(dialog_sanitize "$3")" >> "$DIALOG_CMD_FILE"
+}
+
+dialog_progress() { # $1 = completed count, $2 = text
+    [[ $DIALOG_ENABLED -eq 1 ]] || return 0
+    echo "progress: $1" >> "$DIALOG_CMD_FILE"
+    echo "progresstext: $(dialog_sanitize "$2")" >> "$DIALOG_CMD_FILE"
+}
+
+dialog_finish() { # $1 = title, $2 = message, enables the Close button
+    [[ $DIALOG_ENABLED -eq 1 ]] || return 0
+    echo "title: $(dialog_sanitize "$1")" >> "$DIALOG_CMD_FILE"
+    echo "message: $(dialog_sanitize "$2")" >> "$DIALOG_CMD_FILE"
+    echo "button1text: Close" >> "$DIALOG_CMD_FILE"
+    echo "button1: enable" >> "$DIALOG_CMD_FILE"
+}
+
+dialog_close() {
+    [[ $DIALOG_ENABLED -eq 1 ]] || return 0
+    echo "quit:" >> "$DIALOG_CMD_FILE"
+    sleep 1
+    rm -f "$DIALOG_CMD_FILE"
+    DIALOG_ENABLED=0
+}
+
+# swiftDialog splits command-file lines on commas and colons. Keep text on one line and strip those.
+dialog_sanitize() {
+    local text="$1"
+    text="${text//$'\r'/ }"
+    text="${text//$'\n'/ }"
+    text="${text//,/;}"
+    printf '%s' "${text:0:140}"
 }
 
 # BEGIN helpers (pure text handling, unit tested in tests/test_filters.sh)
