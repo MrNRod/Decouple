@@ -60,7 +60,7 @@ the migration. The LKDC then creates the missing entries. Running the script aga
 
 ## Logging
 
-Everything is logged to `/var/log/decouple.log` (root-only) and to the console, one line per action. There are three levels: `INFO` (what happened), `WARN` (a problem the run continues past) and `ERROR` (the run stopped).
+Everything is logged to `/var/log/decouple.log` (world-readable, so an end user can send it to IT) and to the console, one line per action. No password data or hashes are logged. There are three levels: `INFO` (what happened), `WARN` (a problem the run continues past) and `ERROR` (the run stopped).
 
 ## swiftDialog (optional)
 
