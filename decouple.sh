@@ -1,9 +1,9 @@
 #!/bin/bash
 # Converts an Active Directory mobile account into a local account that matches a fresh local account.
-# EnrollmentUser = the account to convert. GrantAdmin=true (optional, default off) adds it to the admin group.
-# VerifyOnly=true (optional) only logs the differences from a fresh account and changes nothing.
-# UseDialog=true (optional) shows progress in swiftDialog if /usr/local/bin/dialog is installed.
-# Exit codes: 0 done (or nothing to do), 1 stopped, 2 differences from a fresh account remain (or VerifyOnly found some).
+# enrollmentUser = the account to convert. grantAdmin=true (optional, default off) adds it to the admin group.
+# verifyOnly=true (optional) only logs the differences from a fresh account and changes nothing.
+# useDialog=true (optional) shows progress in swiftDialog if /usr/local/bin/dialog is installed.
+# Exit codes: 0 done (or nothing to do), 1 stopped, 2 differences from a fresh account remain (or verifyOnly found some).
 # See the README for usage and credits.
 Version=2.0  # Decouple
 
@@ -15,7 +15,7 @@ log_message() {
 }
 
 # --- swiftDialog (optional) ---------------------------------------------------------------
-# If /usr/local/bin/dialog is installed and UseDialog=true, shows a progress dialog.
+# If /usr/local/bin/dialog is installed and useDialog=true, shows a progress dialog.
 # If not, every dialog_* function is a silent no-op and the script runs headless.
 DIALOG_BIN="/usr/local/bin/dialog"
 DIALOG_CMD_FILE=""
@@ -23,8 +23,8 @@ DIALOG_PID=""
 DIALOG_ENABLED=0
 
 dialog_init() {
-    is_enabled "${UseDialog:-false}" || return 0
-    [[ -x "$DIALOG_BIN" ]] || { log_message "INFO" "UseDialog=true but swiftDialog not found at $DIALOG_BIN; running headless"; return 0; }
+    is_enabled "${useDialog:-false}" || return 0
+    [[ -x "$DIALOG_BIN" ]] || { log_message "INFO" "useDialog=true but swiftDialog not found at $DIALOG_BIN; running headless"; return 0; }
     # No GUI at the login window.
     local console_user; console_user=$(stat -f%Su /dev/console 2>/dev/null)
     [[ "$console_user" != "loginwindow" && -n "$console_user" ]] || { log_message "INFO" "No console user; running headless"; return 0; }
@@ -247,7 +247,7 @@ is_ad_shell() {
     [[ -n "$2" && "$1" == "$2" && "$1" != "$FRESH_SHELL" ]]
 }
 
-# True for GrantAdmin / VerifyOnly values that switch the option on.
+# True for grantAdmin / verifyOnly values that switch the option on.
 is_enabled() {
     case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
         true | yes | 1) return 0 ;;
@@ -503,7 +503,7 @@ RemoveStaffListing() {
 
 # Opt-in. A fresh local account isn't an admin unless asked to be.
 GrantAdminRights() {
-    is_enabled "$GrantAdmin" || return 0
+    is_enabled "$grantAdmin" || return 0
     in_group admin "$username" && return 0
     if dseditgroup -o edit -a "$username" -t user admin; then
         log_message "INFO" "Added $username to the admin group"
@@ -635,10 +635,10 @@ if [[ $EUID -ne 0 ]]; then
 fi
 [[ -e "$LOG_FILE" ]] || ( umask 022; : > "$LOG_FILE" )
 
-username=$EnrollmentUser
-GrantAdmin=${GrantAdmin:-false}
-VerifyOnly=${VerifyOnly:-false}
-UseDialog=${UseDialog:-false}
+username=$enrollmentUser
+grantAdmin=${grantAdmin:-false}
+verifyOnly=${verifyOnly:-false}
+useDialog=${useDialog:-false}
 
 if [[ ! "$username" =~ ^[A-Za-z0-9._-]{1,64}$ || "$username" == -* ]]; then
     log_message "ERROR" "Invalid target user name: '$username'"
@@ -674,7 +674,7 @@ fi
 while IFS= read -r line; do
     log_message "INFO" "Found: $line"
 done <<<"$differences"
-if is_enabled "$VerifyOnly"; then
+if is_enabled "$verifyOnly"; then
     log_message "INFO" "Verify only: nothing was changed"
     if [[ $DIALOG_ENABLED -eq 1 ]]; then
         dialog_start "AD to Local: $username" "Differences found (verify only, nothing changed)." \

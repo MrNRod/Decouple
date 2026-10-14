@@ -118,12 +118,12 @@ check "a longer key doesn't count" "unlockOptions" "$(missing_writers "dsAttrTyp
 dsAttrTypeNative:_writers_inputSources
 dsAttrTypeNative:_writers_unlockOptionsX")"
 
-# --- search paths and the GrantAdmin switch
+# --- search paths and the grantAdmin switch
 check "AD search path"     yes "$(truthy is_ad_search_path '/Active Directory/All Domains')"
 check "domain search path" yes "$(truthy is_ad_search_path '/Active Directory/CORP/corp.example.com')"
 check "local search path"  no  "$(truthy is_ad_search_path '/Local/Default')"
-for v in true TRUE yes 1; do check "GrantAdmin=$v is on" yes "$(truthy is_enabled "$v")"; done
-for v in false no 0 "" maybe; do check "GrantAdmin='$v' is off" no "$(truthy is_enabled "$v")"; done
+for v in true TRUE yes 1; do check "grantAdmin=$v is on" yes "$(truthy is_enabled "$v")"; done
+for v in false no 0 "" maybe; do check "grantAdmin='$v' is off" no "$(truthy is_enabled "$v")"; done
 
 # --- find_differences on a stubbed AD mobile account: every difference must be reported
 plist_doc() { # $1 = key, rest = values
