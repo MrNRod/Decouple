@@ -86,6 +86,8 @@ dialog_close() {
     DIALOG_ENABLED=0
 }
 
+# BEGIN helpers (pure text handling, unit tested in tests/test_filters.sh)
+
 # swiftDialog splits command-file lines on commas and colons. Keep text on one line and strip those.
 dialog_sanitize() {
     local text="$1"
@@ -95,7 +97,21 @@ dialog_sanitize() {
     printf '%s' "${text:0:140}"
 }
 
-# BEGIN helpers (pure text handling, unit tested in tests/test_filters.sh)
+# True for a short name the script will act on: letters, digits, . _ - only, at most 64, not starting with -.
+is_valid_username() { # $1 = name
+    [[ "$1" =~ ^[A-Za-z0-9._-]{1,64}$ && "$1" != -* ]]
+}
+
+# True only when $1 is exactly /Users/<name> (any case). The home folder is changed with chown and find
+# as root, so a record pointing at /, /Users or a path with .. must never get that far.
+is_safe_home() { # $1 = NFSHomeDirectory, $2 = user name
+    [[ "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" == "/users/$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" ]]
+}
+
+# Reads `diskutil apfs listCryptoUsers` output on stdin; prints the UUIDs, upper case, sorted, space separated.
+parse_crypto_users() {
+    grep -Eo '[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}' | tr '[:lower:]' '[:upper:]' | sort | tr '\n' ' '
+}
 
 # Attributes an AD mobile account adds and a local account never has (lower case, namespace stripped).
 # AppleMetaRecordName holds the AD distinguished name on a mobile account; a fresh one has none.
@@ -352,7 +368,7 @@ HAD_SECURETOKEN=0
 FILEVAULT_ON=0
 CRYPTO_BEFORE=""
 crypto_users() {
-    diskutil apfs listCryptoUsers / 2>/dev/null | grep -Eo '[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}' | tr '[:lower:]' '[:upper:]' | sort | tr '\n' ' '
+    diskutil apfs listCryptoUsers / 2>/dev/null | parse_crypto_users
 }
 
 CaptureFileVaultState() {
@@ -640,7 +656,7 @@ grantAdmin=${grantAdmin:-false}
 verifyOnly=${verifyOnly:-false}
 useDialog=${useDialog:-false}
 
-if [[ ! "$username" =~ ^[A-Za-z0-9._-]{1,64}$ || "$username" == -* ]]; then
+if ! is_valid_username "$username"; then
     log_message "ERROR" "Invalid target user name: '$username'"
     exit 1
 fi
@@ -654,6 +670,10 @@ dialog_init
 
 uid=$(id -u "$username")
 homedir=$(dscl . -read "/Users/$username" NFSHomeDirectory | sed 's/^NFSHomeDirectory: //')
+if ! is_safe_home "$homedir" "$username"; then
+    log_message "ERROR" "The home folder of $username is '$homedir', not /Users/$username. Stopping before any change."
+    exit 1
+fi
 original_gid=$(dscl . -read "/Users/$username" PrimaryGroupID | awk '{print $2}')
 original_shell=$(record_values "/Users/$username" UserShell)
 ad_shell=$(record_values "/Users/$username" dsAttrTypeNative:original_shell)

@@ -9,7 +9,7 @@ helpers=$(sed -n '/^# BEGIN helpers/,/^# END helpers/p;/^# BEGIN readonly checks
 [[ -n "$helpers" ]] || { echo "Could not find the helpers block in $SCRIPT"; exit 2; }
 eval "$helpers"
 # A missing function must fail loudly instead of reading as "not flagged".
-for fn in attr_values_from_plist plist_keys record_values search_paths extra_policy_keys plist_value_as_xml account_policy_xml is_ad_shell is_stock_home_mode missing_writers home_acl_is_stock is_enabled is_ad_search_path find_differences is_bound in_group is_ad_authority_entry is_ad_alt_identity is_domain_alias is_ad_attribute_key; do
+for fn in attr_values_from_plist plist_keys record_values search_paths extra_policy_keys plist_value_as_xml account_policy_xml is_ad_shell is_stock_home_mode missing_writers home_acl_is_stock is_enabled is_ad_search_path find_differences is_bound in_group is_ad_authority_entry is_ad_alt_identity is_domain_alias is_ad_attribute_key is_valid_username is_safe_home parse_crypto_users dialog_sanitize; do
     declare -F "$fn" >/dev/null || { echo "helper not loaded: $fn"; exit 2; }
 done
 
@@ -53,6 +53,37 @@ for k in dsAttrTypeStandard:RecordName dsAttrTypeStandard:AuthenticationAuthorit
          dsAttrTypeStandard:AppleMetaNodeLocation dsAttrTypeStandard:UserShell; do
     check "kept attribute $k" no "$(truthy is_ad_attribute_key "$k")"
 done
+
+# --- user name: the script runs dscl, id and chown with it, so anything but a plain short name is refused
+for n in jdoe john.doe j_doe-2 A1; do check "valid user name $n" yes "$(truthy is_valid_username "$n")"; done
+for n in "" "-rf" "a b" 'a;rm -rf /' '$(id)' 'a`id`' "a/b" 'a"b' "é" $'a\nb'; do
+    check "unsafe user name [$n]" no "$(truthy is_valid_username "$n")"
+done
+check "65 characters is too long" no "$(truthy is_valid_username "$(printf 'a%.0s' $(seq 65))")"
+check "64 characters is allowed"  yes "$(truthy is_valid_username "$(printf 'a%.0s' $(seq 64))")"
+
+# --- home folder: must be exactly /Users/<name> before anything is chowned or searched as root
+check "home is /Users/<name>"       yes "$(truthy is_safe_home /Users/jdoe jdoe)"
+check "home case is ignored"        yes "$(truthy is_safe_home /Users/JDoe jdoe)"
+for h in /Users/other / /Users /Users/ /Users/../jdoe /Users/jdoe/ /Users/jdoe/Library Users/jdoe /jdoe /var/empty "" /Users/jdoe.CORP; do
+    check "unsafe home [$h]" no "$(truthy is_safe_home "$h" jdoe)"
+done
+
+# --- FileVault: the crypto users listed before and after must be compared as the same text
+CRYPTO_OUT='Cryptographic Users for disk3s5 (2 found)
+|
++-- ebc6c064-2f3d-4cb8-9a57-9d6f1f1b3a10
+|   Type: iCloud Recovery Key
++-- 9CBD8180-82AE-414C-8D00-2401A5B92916
+    Type: Local Open Directory User'
+check "crypto users: upper case, sorted, space separated" "9CBD8180-82AE-414C-8D00-2401A5B92916 EBC6C064-2F3D-4CB8-9A57-9D6F1F1B3A10 " "$(printf '%s\n' "$CRYPTO_OUT" | parse_crypto_users)"
+check "crypto users: FileVault off lists nothing" "" "$(printf '%s\n' 'No cryptographic users found.' | parse_crypto_users)"
+
+# --- swiftDialog: command text is untrusted; it must not add a field, a line or a command
+check "dialog: comma becomes semicolon, newline a space" "bad; status: success quit:" "$(dialog_sanitize $'bad, status: success\nquit:')"
+check "dialog: CRLF is two spaces"      "a  b" "$(dialog_sanitize $'a\r\nb')"
+check "dialog: text is cut at 140"      140 "$(dialog_sanitize "$(printf 'x%.0s' $(seq 500))" | wc -c | tr -d ' ')"
+sanitized=$(dialog_sanitize $'a\nb\nc'); check "dialog: no newline survives" yes "$([[ "$sanitized" != *$'\n'* ]] && echo yes)"
 
 # --- plist parsing: fixture with the AD entry FIRST (the case that broke v1.7)
 fixture='<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>dsAttrTypeStandard:AuthenticationAuthority</key><array>'
@@ -179,6 +210,65 @@ The user is listed in the staff group; on a fresh account only root is
 check "mobile account: every difference reported" "$expected" "$(find_differences)"
 unset -f dscl dsconfigad dseditgroup plist_doc find
 check "real find: a stock home folder has no item without a group" "" "$(find "$homedir" -xdev -nogroup)"
+
+# --- find_differences on a stubbed FRESH local account, then one difference at a time. A fresh account
+# must report nothing (this runs on any Mac, unlike the live check below), and each single leftover
+# must be reported by itself, so one finding can't hide behind another.
+plist_doc() { # $1 = key, rest = values (the stub block above unset its copy)
+    local key="$1" out="<plist version=\"1.0\"><dict><key>$1</key><array>" v; shift
+    for v in "$@"; do out+="<string>$(xml_escape "$v")</string>"; done
+    printf '%s' "$out</array></dict></plist>"
+}
+S_AUTH=("$SHADOW" "$LKDC" "$TOKEN"); S_ALT=("X509:<T>Apple"); S_NAMES=(jdoe); S_GID=20; S_SHELL=/bin/zsh
+S_STAFF="root"; S_NET=0; S_BOUND=0; S_NESTED=0; S_EXTRA_KEY=""; S_SEARCH=(/Local/Default)
+reset_stub() {
+    S_AUTH=("$SHADOW" "$LKDC" "$TOKEN"); S_ALT=("X509:<T>Apple"); S_NAMES=(jdoe); S_GID=20; S_SHELL=/bin/zsh
+    S_STAFF="root"; S_NET=0; S_BOUND=0; S_NESTED=0; S_EXTRA_KEY=""; S_SEARCH=(/Local/Default)
+}
+dscl() {
+    case "$*" in
+        "-plist . -read /Users/jdoe AuthenticationAuthority") plist_doc dsAttrTypeStandard:AuthenticationAuthority "${S_AUTH[@]}" ;;
+        "-plist . -read /Users/jdoe AltSecurityIdentities") plist_doc dsAttrTypeStandard:AltSecurityIdentities "${S_ALT[@]}" ;;
+        "-plist . -read /Users/jdoe RecordName") plist_doc dsAttrTypeStandard:RecordName "${S_NAMES[@]}" ;;
+        "-plist . -read /Users/jdoe dsAttrTypeNative:accountPolicyData")
+            plist_doc dsAttrTypeNative:accountPolicyData '<plist version="1.0"><dict><key>creationTime</key><real>1.0</real></dict></plist>' ;;
+        "-plist . -read /Users/jdoe")
+            printf '%s' '<plist version="1.0"><dict><key>dsAttrTypeStandard:RecordName</key><array><string>jdoe</string></array>'
+            printf '%s' '<key>dsAttrTypeNative:_writers_AvatarRepresentation</key><array><string>jdoe</string></array>'
+            printf '%s' '<key>dsAttrTypeNative:_writers_inputSources</key><array><string>jdoe</string></array>'
+            printf '%s' '<key>dsAttrTypeNative:_writers_unlockOptions</key><array><string>jdoe</string></array>'
+            [[ -n "$S_EXTRA_KEY" ]] && printf '%s' "<key>$S_EXTRA_KEY</key><array><string>x</string></array>"
+            printf '%s' '</dict></plist>' ;;
+        ". -read /Users/jdoe PrimaryGroupID") echo "PrimaryGroupID: $S_GID" ;;
+        "-plist . -read /Users/jdoe UserShell") plist_doc dsAttrTypeStandard:UserShell "$S_SHELL" ;;
+        ". -read /Groups/staff GroupMembership") echo "GroupMembership: $S_STAFF" ;;
+        "-plist /Search -read . CSPSearchPath") plist_doc dsAttrTypeStandard:CSPSearchPath "${S_SEARCH[@]}" ;;
+        "-plist . -read /Groups/admin NestedGroups") [[ $S_NESTED -eq 1 ]] && plist_doc dsAttrTypeStandard:NestedGroups "AAAA-BBBB" ;;
+        *) return 1 ;;
+    esac
+}
+dsconfigad() { [[ $S_BOUND -eq 1 ]] && echo "Active Directory Domain = corp.example.com"; return 0; }
+dseditgroup() { [[ $S_NET -eq 1 && "$*" == "-o checkmember -m jdoe netaccounts" ]] && echo "yes jdoe is a member of netaccounts"; return 0; }
+find() { :; }
+chmod 600 "$homedir/.CFUserTextEncoding"
+username=jdoe
+
+reset_stub
+check "fresh local account: nothing reported" "" "$(find_differences)"
+S_NET=1;  check "only netaccounts membership" "The user is in netaccounts (network account); a fresh account is in localaccounts" "$(find_differences)"; reset_stub
+S_STAFF="root jdoe"; check "only staff membership" "The user is listed in the staff group; on a fresh account only root is" "$(find_differences)"; reset_stub
+S_BOUND=1; check "only still bound" "This Mac is still bound to Active Directory" "$(find_differences)"; reset_stub
+S_NESTED=1; check "only admin nested groups" "The admin group has nested (AD) groups" "$(find_differences)"; reset_stub
+S_GID=12; check "only primary group" "PrimaryGroupID is 12, a fresh account uses 20" "$(find_differences)"; reset_stub
+S_SEARCH=(/Local/Default "/Active Directory/All Domains"); check "only AD search path" "Active Directory is still in the search path" "$(find_differences)"; reset_stub
+S_NAMES=(jdoe jdoe@corp.example.com); check "only domain alias" "RecordName has a domain alias: jdoe@corp.example.com" "$(find_differences)"; reset_stub
+# Half-migrated: everything cleaned except one attribute.
+S_EXTRA_KEY=dsAttrTypeStandard:SMBSID; check "half-migrated: only SMBSID left" "AD attribute remains: dsAttrTypeStandard:SMBSID" "$(find_differences)"; reset_stub
+S_EXTRA_KEY=dsAttrTypeStandard:AppleMetaRecordName; check "only AppleMetaRecordName left" "AD attribute remains: dsAttrTypeStandard:AppleMetaRecordName" "$(find_differences)"; reset_stub
+S_AUTH=("$SHADOW" "$ADK" "$LKDC" "$TOKEN"); check "only an AD Kerberos entry left" "AuthenticationAuthority has an AD entry: Kerberosv5" "$(find_differences)"; reset_stub
+# A shell the user picked is theirs; only the one AD assigned is a difference (original_shell is stubbed absent).
+S_SHELL=/opt/homebrew/bin/fish; check "a shell the user chose is not reported" "" "$(find_differences)"; reset_stub
+unset -f dscl dsconfigad dseditgroup plist_doc find reset_stub
 
 # --- real, unmodified local account on this Mac: nothing may be flagged
 if [[ "${1:-}" != "--no-live" ]] && u=$(stat -f%Su /dev/console) && dscl . -read "/Users/$u" &>/dev/null; then
