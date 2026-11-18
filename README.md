@@ -2,7 +2,7 @@
 
 ## Description
 
-Decouple converts an Active Directory (AD) mobile account on macOS into a local account that matches a fresh local account. This is useful for detaching a Mac from AD while preserving the user's home folder and settings. It does the same work as the ADToLocal app.
+Decouple converts an Active Directory (AD) mobile account on macOS into a local account that matches a fresh local account. This is useful for detaching a Mac from AD while preserving the user's home folder and settings.
 
 ## Usage
 
@@ -27,14 +27,14 @@ Upload the script to your MDM and set the variables in its execution environment
 | Code | Meaning |
 | :--- | :--- |
 | `0` | Done, or nothing to do. |
-| `1` | Stopped: not root, invalid or missing user, the backup failed, or the FileVault guard tripped. |
+| `1` | Stopped: not root, invalid or missing user, the user's home folder is not `/Users/<name>`, the backup failed, or the FileVault guard tripped. |
 | `2` | Finished, but the account still differs from a fresh local account (see the log). With `verifyOnly=true`: differences were found. |
 
 ## What it does
 
 Only the steps the account needs are run, in this order:
 
-1. **Compare** the account with a fresh local account. Nothing to fix means nothing is changed.
+1. **Check the input and compare.** The user name must be a plain short name, and the account's home folder must be exactly `/Users/<name>`, because the home folder is changed as root; otherwise the run stops before any change. Then the account is compared with a fresh local account. Nothing to fix means nothing is changed.
 2. **Back up** the account record to `/var/log/decouple_backup_<user>_<time>.plist` (root-only, no password hash).
 3. **Unbind** the Mac from AD (with retries and a check), remove AD from the search paths and set the search policy back to Automatic.
 4. **Authentication authority:** remove only the AD entries (`LocalCachedUser`, AD `Kerberosv5`). `ShadowHash`, `SecureToken` and the local `@LKDC` Kerberos entry are never removed, so the local password and the FileVault login keep working. The run stops if the `SecureToken` or FileVault crypto-user entry disappears.
@@ -76,7 +76,7 @@ sudo useDialog=true enrollmentUser="username" ./decouple.sh
 
 ## Testing
 
-Tests for the parsing and filtering helpers, and for the detection logic against a stubbed mobile account and this Mac's real account (read-only). Run with the macOS bash:
+Tests for the parsing and filtering helpers (including the user name, home folder and swiftDialog text checks), and for the detection logic against stubbed fresh and mobile accounts, each leftover on its own, and this Mac's real account (read-only). Run with the macOS bash:
 
 ```
 /bin/bash tests/test_filters.sh
@@ -108,11 +108,6 @@ Test on a disposable Mac first. Version history is in git.
 
 ## Credits
 
-- `MigrateUserHomeToDomainAcct.sh` by [Patrick Gallagher](https://twitter.com/patgmac), with guidance from [Lisa Davies](http://lisacherie.com/?p=239)
+- `MigrateUserHomeToDomainAcct.sh` by [Patrick Gallagher](https://github.com/patgmac), with guidance from [Lisa Davies](http://lisacherie.com/?p=239)
 - `MigrateADMobileAccounttoLocalAccount.command` by [Rich Trouton](https://github.com/rtrouton/rtrouton_scripts/tree/main/rtrouton_scripts/migrate_ad_mobile_account_to_local_account), with contributions from Rick Lemmon (AD unbind process) and an anonymous reporter (macOS 10.14.4 ShadowHashData fix)
 - `decouple.sh` by Noel Rodriguez-Lebron
-
-
-## Related project
-
-A macOS app version of this tool is available: [decouple-app](https://github.com/MrNRod/decouple-app). It has a native SwiftUI interface and the same fresh-account behavior.
